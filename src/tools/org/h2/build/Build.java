@@ -213,7 +213,7 @@ public class Build extends BuildBase {
             args = args.plus("-source", "1.5", "-target", "jsr14", "-bootclasspath", bcp);
         }
         if (debugInfo) {
-            args = args.plus("-Xlint:unchecked",
+            args = args.plus("-Xlint:unchecked", "-g",
                     "-d", "temp", "-sourcepath", "src/main", "-classpath", classpath);
         } else {
             args = args.plus("-Xlint:unchecked", "-g:none",
