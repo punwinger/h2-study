@@ -2,5 +2,652 @@
 1. 每个客户端连接产生TcpServerThread线程
 2. 每个数据库产生WriterThread（负责定时flush）以及FileLock对象（Lock method）
 
+Database相关：
+*每个DataBase对象有一个PageStore对象表示Database文件的页集合。
+*PageStore是整个Database的存储层抽象；包含FileStore对象，封装随机访问文件的功能，包含CacheLRU对象，利用LRU算法缓存Page数据
+*PageStore同时负责通过PageId读取底层文件中不同类型的Page（如PageDataLeaf,PageDataNode, PageBtreeLeaf, PageBtreeNode等）。
+*FileStore对象可以根据实际情况修改底层访问，如FileDisk、FileMem等
+
+*创建PageStore的时候，会从文件的Page 4读取meta table的root page数据(其中包括所有表的索引的indexId和对应的rootPageId)
+*然后创建Public.SYS. Public.SYS保存创建其它元数据表的SQL语句
+
+*PageStore读取一个指定pageId的Page时候，根据pageId << pageSizeShift计算Page的偏移，然后读取pageSize大小（默认2048）到byte数组中。即文件按照固定pageSize大小分每个Page。
+
+*RegularTable对象表示数据库中的表。
+*RegularTable初始化的时候，如果是持久化则创建PageDataIndex作为mainIndex和scanIndex，否则创建ScanIndex对象作为scanIndex，mainIndex为null。
+*RegularTable的primary key是单一列，并且类型是long,int,short,byte的时候，会创建封装mainIndex的PageDelegateIndex作为primary key的索引，否则会创建PageBtreeIndex作为primary key的索引。
+
+DataBase
+|
+|--RegularTable meta(Public.SYS)
+|--PageStore
+   |
+   |--CacheLRU
+   |--FileStore
+
+
+(以下开始索引的讨论，暂时忽略用于地理坐标的spatial类型的index)
+====    PageIndex   ====  
+*PageIndex是索引类（PageBtreeIndex, PageDataIndex以及PageDelegateIndex）的基类
+*成员变量rootPageId指示对应的PageDataNode/PageDataLeaf或PageBtreeNode/PageBtreeLeaf根索引数据页；
+*PageBtreeIndex, PageDataIndex子类都有PageStore的引用方便从rootPageId获取索引数据页
+
+
+====  Page索引页数据  ====
+Page
+|
+--PageData
+| |
+| --PageDataNode
+| --PageDataLeaf
+|
+--PageBtree
+  |
+  --PageBtreeNode
+  --PageBtreeLeaf
+
+
+PageData（PageDataNode/PageDataLeaf父类）
+--PageDataIndex index
+--int parentPageId
+--Data data         data page
+--int entryCount    number of entries
+--long[] keys       row keys
+
+PageDataNode
+--int[] childPageIds
+layout:
+entries (child page id: int, key: varLong)
+
+PageDataLeaf
+--int[] offsets     row offsets
+--Row[] rows        the rows
+layout:
+list of key / offset pairs (key: varLong, offset: shortInt)
+data
+
+PageBtree（PageBtreeNode/PageBtreeLeaf父类）
+--PageBtreeIndex index
+--int parentPageId
+--Data data         data page
+--int[] offsets     read data to get child page key
+--int entryCount    number of entries
+--SearchRow[] rows  index data
+--onlyPosition      data是否只保存row的key（scanIndex的key），详细见下面
+
+PageBtreeNode
+--int[] childPageIds
+layout:
+entries (child page id: int, offset: short)   offsets
+
+PageBtreeLeaf
+layout:
+list of offsets: short
+data (key: varLong, value,...)
+
+
+*XNode类是内部结点，XLeaf类作为叶子结点
+*内部成员rootPageId所指示索引页，如果数据量少，则指定一个XLeaf，数据量大，rootPageId则指定XNode。
+*结构都是由多层XNode内部结点到最后XLeaf叶子结点的树。
+
+
+====  PageDataIndex/PageDataNode/PageDataLeaf ====
+*PageDataIndex主要作用就是组织表数据，RegularTable默认创建的mainIndex，只可以用于mainIndex。
+
+*primary key符合条件（单列，并且类型是long,int,short,byte）时，primary key的Index类就简单封装PageDataIndex，同时PageDataNode/PageDataLeaf保存的keys就是primary key的值，否则parimary key的Index类就是PageBtreeIndex类，PageDataNode/Leaf保存的keys数组是对应每个row的自增值。
+
+*PageDataNode保存Keys和对应的childPageIds表示子页PageDataLeaf/PageDataNode的pageId，查找key时，通过二分查找找到对应的子页的pageId。然后通过PageStore获取对应的子页
+
+*PageDataLeaf内部保存Key和对应的offset。keys数组表示保存的key，offsets数组表示成员变量data里面每个key对应的数据offset。data保存的数据是row的全部列的值。
+
+
+====  PageBtreeIndex/PageBtreeNode/PageBtreeLeaf  ====
+*PageBtreeIndex就是二级B树索引，用于主键或者二级索引，不能用于内部scanIndex的索引（另外还有SpatialTreeIndex，基于MVR TreeMap，R树的一个实现）。
+*PageBtreeNode与PageDataNode类似，代表的是B树的内部结点，PageBtreeLeaf则是其B树的叶子结点。
+
+*onlyPosition成员变量，指示data是否只保存row的key，注意key为scanIndex所表示的key，即可能为primary key或者内部自增key。默认false。
+ true，则获取row的时候，需要通过offset获取data里面的key，然后通过RegularTable的scanIndex去查找对应的row的所有列的数据（同样利用二分查找）。由于需要scanIndex查找，产生更多的I/O。
+ false，则获取row的时候，直接通过offset获取data里面的数据，也就是row对应所有 索引列 的数据。注意只是索引列。直接从内存中data数据获取，不要消耗I/O。
+ 一般在PageBtreeNode插入新的childPage，或者PageBtreeLeaf插入新的row的时候data空间不足的时候可能会令onlyPosition=true，另外还要考虑split的情况。(TODO)
+
+*PageBtreeNode/Leaf在二分查找的时候，根据row的索引列进行Value值对比：首先根据两个比较类型，按照规则转换到同一个指定类型，然后进行比较。
+
+*迭代PageBtreeCursor
+
+*默认NULL比较时，会小于任何非NULL的值，因此NULL会排在最前
+
+== SQL Parser ==
+使用Recursive descent中的predictive parser算法（https://en.wikipedia.org/wiki/Recursive_descent_parser）
+
+流程：
+Parser.parse(String sql)
+1.initialize(String sql) 把sql转换大写，同时解析每个字符的所属类型（CHAR_SPECIAL_1，CHAR_NAME等）
+2.read(), parsePrepared() 根据第一个符号分类进行SQL解析。parseSelect, parseInsert, parseDelete etc.
+3.parseSelect() parse的具体过程，根据符号进行predictive parse，注意区分parseSelectUnion, parseSelectSimple等  
+4.Select.prepare() 进行SQL优化（包括解析列名称，值优化、索引选择），CBO选择最优执行计划，各种优化细节等。
+5.解析结果Command放入cache中
+
+
+//select
+======================================
+=============== Select ===============
+======================================
+
+
+*Select命令执行的时候，每个表用TableFilter表示，每个TableFilter只能有一个index。
+*TableFilter有IndexCursor cursor对象，方便利用PageIndex对象进行迭代查询
+
+*Select.preparePlan() -> Optimizer.optimize() -> Optimizer.calculateBestPlan() 如果只有一个表，则采用计算这个表的cost选择select索引。少于等于7个表的时候，采用BruteForce算法（应该是对所有排列可能性计算cost）
+*计算表的cost的时候，如果没有可用索引的条件语句，则使用RegularTable的scanIndex作为此次查询的索引。否则遍历所有索引，调用Index.getCost，通过where中条件列的情况，以及sortOrder计算cost，并选择出cost最低的索引，因此每次一个table只能一个索引。
+对于B-树范围索引，计算cost的方法是BaseIndex.getCostRangeIndex()。具体cost计算方法建议查看代码。需要考虑多列索引的情况下，每一列指定相等、范围、半范围条件的情况，另外还要考虑符合order by的情况下，可以减轻cost。
+
+
+TableFilter -> IndexCursor(支持IN(..)以及IN(SELECT ...)优化) -> PageDataCursor/PageBtreeCursor
+
+*IndexCursor in优化？
+*PageDataCursor的成员变量maxKey在每次迭代的时候判断是否超出范围，成员变量idx表示当前的row索引
+
+*rowCount。计算cost的时候，rowCount是必须的。rowCount在PageDataIndex/PageBtreeIndex, RegularTable, Page都有保存。rowCount会保存到page head中，初始化会从Page读取出来，如果无效则会遍历树计算。另外要注意表数据格式有修改的时候，rowCount的值会跟着修改。
+
+
+--------
+//select * from test where id = 5;
+1.CommandContainer.query(int maxrows); 
+2.Query.query(int limit, ResultTarget target);
+  fireBeforeSelectTriggers() 激发触发器
+
+3.Select.queryFlat() //Not groupby/join/distinct
+  TableFilter.next() 
+
+  1.IndexCursor.find() //index type
+
+    PageDataIndex.find(Session session, long first, long last, boolean multiVersion) (或者PageBtreeIndex)
+      PageDataIndex.getPage()
+        PageStore.getPage()
+          CacheLRU.get() CacheLRU查找page data。CacheLRU没有使用mysql把缓存队列分为old/young。
+                          另外，CacheLRU里缓存有PageDataLeaf,PageBtreeLeaf等B树以及data叶子节点。
+          PageDataLeaf.find() 调用PageData.find()，二分查找。如果一个PageDataLeaf放不下，就会在PageDataNode
+
+    二分查找成功后，cursor = PageDataCursor
+
+  2.IndexCurosr.next()
+    PageDataCursor.next()
+
+
+=====  Select.queryFlat ===== 
+select * from test where id = 5;
+
+--Path
+Select.queryFlat(TableFilter) -> IndexCursor(支持IN(..)以及IN(SELECT ...)优化) -> PageDataCursor/PageBtreeCursor
+
+*该过程中，直接拿RegularTable的scanIndex进行迭代，key的最小值和最大值为Long.MIN_VALUE和Long.MAX_VALUE，然后不断遍历叶子结点遍历数据。要注意的是叶子结点PageBtreeLeaf/PageDataLeaf的遍历过程: 两个兄弟叶子结点之间并没有指针连接起来，遍历完这个叶子结点要通过递归查询父结点获取下一个兄弟结点。具体为PageDataLeaf.getNextPage / PageBtreeLeaf.nextPage
+
+
+*select索引过程中，首先从索引条件中解析出索引的最小值(>= LONG_MIN)和最大值(<= LONG_MAX)，然后去寻找所属范围最可能包含最小key的PageDataLeaf，寻找成功后PageDataLeaf构造一个PageDataCursor返回。然后TableFilter就开始进行cursor的迭代操作。超出范围则会退出迭代。
+
+
+Condidtion总体：
+返回boolean值或NULL的条件语句
+Expression
+ - Condition
+    - ConditionNot              Not ...
+    - ConditionAndOr            An 'and' or 'or' condition as in WHERE ID=1 AND NAME=?   index
+    - ConditionInConstantSet    IN(...)中In list全部均为同种类型的常量                   index
+    - CompareLike               where name like xxx                                      index
+    - Comparison                >=,>,<=,<, !=, is null, is not null                      index
+    - ConditionExists           WHERE EXISTS(SELECT ...)
+    - ConditionIn               WHERE NAME IN(...)                                       index
+    - ConditionInSelect         WHERE [ID IN(SELECT ...) / ID >= [ALL/ANY] (SELECT...)]  index
+
+ConditionNot、ConditionExists不会建立索引。
+ConditionAndOr只在And连接的条件建立索引。
+ConditionInConstantSet默认情况下都建立索引。
+CompareLike（like，regexp）中regexp不建立，like中如果patter首字母为匹配字符，即_或%时，则不建立索引，如果比较列类型不为字符也不建立索引。也就是对pattern为%xyz%, _xyz%不建立索引，对于xyz%，建立>=xyz的索引，以及<xy(z+1)的索引
+Comparison，除了!=和is not null不建立索引，其它（>=,>,<=,<,is null等）比较与非自己表的列的表达式值时，都建立索引。
+ConditionIn，要求inList的所有值都不能来自父select，具有非相关性，才能建立索引。
+ConditionInSelect要求子select中selectList，condition，having子句全都不能来自父select语句，也就是与父select非相关，才能建立索引。
+
+对于多重Condition，如where a.name >= 'aaa' and a.id <= 99 and b.v1 = 39 and b.v2 >= 'aaa'，会组成一颗树，根据括号的优先级最高，AND优先级比OR高，从左到右建立的一颗二叉树。
+需要注意的是一个规律是，由于AND比OR优先级高，如果同一层级里出现OR条件，则OR会作为树根，判断的时候会从OR开始。
+
+
+具体细节：
+*操作符>=,>,<=,<比较值的过程中，把形如a > 3的表达式分解为三个对象ExpressionColumn(a)、Comparison(>)、ValueExpression(3)，然后select出值后，通过ExpressionColumn解析出当前值所在列的值，ValueExpression取出指定值，然后Comparison进行比较，如果两种类型不一致，则会每个row都需要进行转型，如a > 3里，a是string类型，则每次都要转换成Int。
+*操作符!=, is not null不会使用索引，以[Long.MIN_VALUE, Long.MAX_VALUE]范围从scanIndex搜索，每个row进行比较判断是否添加到结果集
+*操作符is null会使用索引，对于PageDataIndex，由于key不可能为null，会以[Long.MIN_VALUE, Long.MIN_VALUE]进行一次搜索。对于PageBtreeIndex，由于允许NULL的key存在，则直接以null为key进行搜索，NULL比任何非NULL的值要小，因此所需搜索值都在前面的叶子结点。
+*操作符in(...)，把常量值排序后，逐个利用索引查找。IndexCursor保存了inList，负责迭代inList的值，然后用Index进行查找。
+*操作符Not。一般把Not的condition在内层。在Select层判断中，迭代结果会被NOT内层的condition判断，然后判断结果再进行NOT操作。
+*操作符between ... and ...。编译为ConditionAndOr对象(可初始化为And或者Or，这里是And)，内部包含两个Compairson对象，left和right。left是>=，right是<=。如between start and end：简单地创建以[start, end]为范围，使用index进行搜索，将搜索结果在Select层再进行ConditionAndOr的判断，这里是And，即left和right必须均为true。
+*操作符And，Or。
+1.操作符And，left and right会对left, right表达式尝试建立索引条件，Or则不会建立索引条件。
+2.注意And和Or的短路判断。
+3.And的优先级比Or要高。
+
+*in (select ...)
+select id1 from test_btree t where v2 in (select v2 from test2 where id >= 30) no index
+select id1 from test_btree t where id1 in (select v2 from test2 where id >= 30) index
+
+子select与父select非相关，要分两种情况（no index和index）：
+---如果in表达式的左侧列不能使用索引，则会先逐个查询外层table的行，然后在select的condition过滤中，进行子select查询获取总的结果集（只查询一次，结果集会cache到子Select.lastResult），然后在这个结果集中进行查找，有两个方式 1，对于非all的并且是in/=的相等比较时，使用hash的distinct比较(LocalResult.containsDistinct）使用hash而而不用排序＋binary search可以减少value值的实际比较；2、否则遍历结果集逐个比较判断，要注意考虑是否all，最后返回condtion过滤结果。
+---如果in表达式的左侧列可以使用索引，则左侧列对应的TableFilter会创建indexConditions，这样在计算cost的时候，由于子select是evauable，所以可以创建对应索引。执行时进行子select递归查询，获取结果集，缓存到内存中，再逐个对这些值进行父select的索引查询。
+（对于非相关性，实现就是和缓存小表进行join一样，但是如果in的子select结果集大，则会消耗大量内存。改良方法：可以考虑转化为子select去重后进行nested loop join。如果转化为join之后，则通过改变join顺序可能会提高效率）
+
+子select与父select相关，则不能建立索引，这时会首先逐个查询父select的行，然后再传给子select进行查询（可以根据这个值进行索引查询），看看是否满足in的值相等条件。如select * from test_btree t where id1 in (select v2 from test2 where id = t.id)，则会先逐个查询test_btree的值，然后传入t.id到子select，子select会利用id的索引进行查询，如果存在row，则查看v2是否等于id1，如果等于则添加到结果集。
+以上查询执行效果与join类似：select * from test_btree a join test2 b on (a.id = b.id and a.id1 = b.v2)。但以上的子查询等于限制了join顺序，不能进行优化。
+
+关于join和子查询的比较
+http://stackoverflow.com/questions/2577174/join-vs-sub-query
+结论是1、子查询在逻辑上更加容易理解；2、子查询不用担心B有重复值带来的影响；3、一般情况join比子查询效率更高。
+
+*多重操作符混合。解析过程见Parser.readCondition()。
+*ConditionAndOr.optimize()优化：
+0.根据cost大小，交换left和right（优化选取第一个进行索引查询的策略）
+1.B=A AND B=0 -> B=A AND B=0 AND A=0  (多表join中有用)
+2.B=3 AND B=0 -> B in (3, 0)
+3.A IN(1, 2) OR A=3 -> A IN(1, 2, 3)
+4.短路判断
+*多个in(...)进行And合并。 则选取第一个进行索引查询，然后其它在最终进行condition进行过滤。
+*Or不会建立索引！
+*范围搜索And连接，则会对范围进行交集。
+
+=====  Select.queryGroup/queryQuick/queryGroupSorted =====
+isGroupQuery = true
+
+select count(1) from test;
+group by
+order by
+having ...
+where + index
+
+Expression
+ - Aggregate    integrated aggregate functions, such as COUNT, MAX, SUM.
+
+有以下的type
+COUNT_ALL             COUNT(*)
+COUNT                 COUNT(expression)
+GROUP_CONCAT          GROUP_CONCAT(...)
+SUM                   SUM(expression)
+MIN                   MIN(expression)
+MAX                   MAX(expression)
+AVG                   AVG(expression)
+STDDEV_POP            STDDEV_POP(expression)    (总体的标准差, VAR_POP()的平方根)
+STDDEV_SAMP           STDDEV_SAMP(expression)   (样本的标准差, VAR_SAMP()的平方根)
+VAR_POP               VAR_POP(expression)       (总体的统计方差)
+VAR_SAMP              VAR_SAMP(expression)      (样本的统计方差)
+BOOL_OR               BOOL_OR(expression)
+BOOL_AND              BOOL_AND(expression)
+SELECTIVITY           SELECTIVITY(expression)   (Selectivity 100 means values are unique, 10 means every distinct value appears 10 times on average)
+HISTOGRAM             HISTOGRAM(expression)     （柱状图）
+
+------
+*queryQuick()，一种优化聚集的查找，执行时，直接获取aggreate的值。
+如SELECT COUNT(*) FROM TEST 或者 SELECT MAX(ID) FROM TEST可以采用queryQuick。
+只能COUNT_ALL，COUNT，MIN，MAX的聚集类型。对于COUNT、COUNT_ALL直接获取表的行数即可。对于MIN、MAX根据情况利用索引获取第一个或最后一个的值。
+检查的条件比较严格：
+没有group by，having语句，且只查找一个表
+expressions：类型为COUNT时，里面的表达式不能为distinct且不能为NULL，最后还需要表能直接获取行数。类型为COUNT_ALL只需要表能直接获取行数。类型为MIN、MAX的要存在以该列为第一索引列的索引，如以索引(a,b)，则MIN(a)为true，MAX(b)为false。
+condition：存在有列表达式就为false。
+
+------
+select sum(id), avg(v1) from test2 group by v3 having sum(v2) > 10;
+*queryGroup()：
+首先要索引查找where condition指定的，然后进行group by聚集计算，最后进行having过滤。
+
+聚集过程：
+ValueHashMap<HashMap<Expression, Object>> groups，group by分组和对应表达式分组数据的映射。
+-->  HashMap<Expression, Object>  currentGroup， 某个group by分组的表达式以及对应的聚集数据的映射。
+-->  AggregateData data。具体group by分组的具体select或having表达式的聚集数据。
+-->  调用data.add()将row的值进行叠加计算到聚集数据中。
+having过滤：
+根据分组的key遍历ValueHashMap<HashMap<Expression, Object>> groups，复制出对应的值在row中，然后根据having条件进行过滤，最后添加到结果集中。
+
+*优化的聚集投影（非强制表达式必须出现在group by中）：
+ExpressionColumn.updateAggregate()
+select的表达式以及having表达式中，如果某一列在同一group by分组中的值均相等，则该列可以不需要出现在group by分组。
+
+*Aggreate.updateAggreate() --> AggregateData.add()
+对于COUNT、SUM、MIN、MAX、AVG的处理都很简单，基本在row分到对应分组后进行处理，最后获取结果的时候如有需要继续进行处理。
+
+------
+*queryGroupSorted()  group by index
+isGroupSortedQuery=true
+存在非scan非hash的索引，并且group by的column符合索引前缀的条件（index(a,b,c) good:group by b,a bad:group by a,c)。
+
+总体流程：
+在索引查找后经过where condition过滤，然后通过判断当前分组key是否与上一次的相同，如果相同则用上一次key的分组数据，然后进行聚集计算，如果不同则创建新的分组HashMap<Expression, Object>  currentGroup，并且同时会把上一次分组的数据进行having过滤，添加到结果集。
+这是由于符合前缀索引条件时，可以确保数据按照分组的顺序进行遍历，可以按顺序计算出聚集结果输出单个分组，不需要遍历完所有数据，减轻内存负担。
+
+
+=====  distinct  =====
+Select.distinct=true
+
+------
+*select distinct v1,v2 from test2
+distinct只能放在select表达式第一位，此时所有select表达式组成key进行distinct操作，
+LocalResult.addRow()进行distinct操作，利用ValueHashMap<Value[]> distinctRows。如果结果集超过MAX_MEMORY_ROWS_DISTINCT，会使用临时表。
+
+-----
+*select sum(distinct v1) from test2 group by ...
+与group by流程一致，将在聚集计算的时候进行distinct操作，利用ValueHashMap过滤重复的值。注意此时Select.distinct=false
+
+------
+*queryDistinct
+distinct查询的一个优化，当distinct仅包含一个列col时，存在符合该col的前缀条件的索引，则会利用该索引进行查询，特别的是这里不是范围查找，而是每次指定刚好大于上一次col结果的值来进行查找，这样就不需要在LocalResult进行distinct操作。
+另外要注意该col的selectivity < 20，也就是存在较多的冗余值，这样能过滤更多不必要的查找，更加有效。
+
+
+=====  Order by SortOrder.sort =====
+Select.sort=true
+
+------
+*SortOrder.sort
+查找完所有的结果后，执行LocalResult.done --> SortOrder.sort进行排序。
+如果内存允许，并且没有limit和offset，则直接调用Collections.sort(rows, this)，Java内置的List排序算法进行排序（Timsort，对于部分有序的数组会有远小于NLog(N)，并且对于随机乱序的数组同样保持NLog(N)）。
+如果存在offset或limit，则使用Utils.sortTopN(arr, offset, limit, this)。首先使用快速排序进行部分排序，具体是使[offset, limit + offset - 1]这范围内的值放到这范围上（该范围内的值不一定有序），然后使用Arrays.sort(array, offset, (int) Math.min((long) offset + limit, array.length), comp)保证[offset, limit + offset - 1]有序（Arrays.sort同样是Timsort，仅对指定范围排序，其它范围顺序不变）。
+
+使用快速排序进行部分排序，可以参考Utils.partialQuickSort(X[] array, int low, int high, Comparator<? super X> comp, int start, int end)，关键是在开始增加判断条件(low > end || high < start || (low > start && high < end))，如果成立则直接return，不需要继续排序。
+
+------
+*sortUsingIndex=true
+使用索引进行排序。利用索引的顺序遍历数据，数据集就保证有序，可以避免在最后进行的排序操作，对于结果集数据比较大的时候相当有效。
+使用条件：
+1.符合order by里指定列顺序，非scan和非hash索引，并且索引的每列排序类型必须符合order by的指定（如index(v1, v2), order by v1 asec, v2 desc不符合，order by v1, v2符合），这个索引为排序索引
+2.如果之前经过cost选择的索引current是scan（默认索引），或者与排序索引一致，并且不存在IN条件查询（IN条件查询可能导致遍历结果与order by不一致），则sortUsingIndex=true。
+3.代码上是替换current索引，如果排序索引列排序类型与current索引不一致，但按照cost计算已经考虑order by因素，暂时没有想到这种情况出现。
+
+
+=====  join  =====
+只利用嵌套循环实现join（join可以通过把小表放内存、排序-合并、散列、等方法实现。）（对于小表join下，嵌套循环效果比较简单有效）
+
+inner join
+------
+select a.id, b.v1 from test a join test2 b on a.id = b.id
+select a.id, b.v1 from test a, test2 b where a.id = b.id;
+两条SQL经过parse一致。
+
+*cost计算。列出所有join表的组合A(n, n)(n为join表的数量)(Permutations类实现)作为Plan，分别计算每个Plan的cost，取最小值的plan。每个Plan中，不同的table分别计算cost，cost += cost * item.cost计算plan的总cost。另外要注意当前tableA计算cost之后，evaluatable=true，这样下一个有该tableA关联条件的tableB就可以利用索引计算。
+这里要注意一个可能的规律，小表放在最左边能够使cost更小。（这样会对大表使用索引查找，在嵌套循环更加有效）。因此，在计算完每个table的cost的时候，考虑到indexConditions越多则一般表越小，所以会有以下的计算：
+item.cost -= item.cost * indexConditions.size() / 100 / level;  （level是join表的顺序，100是一个启发式计算值）
+（nested loop实现的join，oracle计算cost = costA + rowA * costB，估计这里为了方便所以是cost = costA + costA * costB）
+
+对于这种cost计算方式，如果join不能使用索引，如以下SQL：
+select * from test_btree a join test2 b on (a.v2 = b.v2);
+a的scan cost为10320，b的scan cost为58880，由于启发式cost对b减小差值较多，因此会令b作为第一个join表（有点像副作用，实际这里join顺序影响不大），实际上是一个cross join最后加上Select的condition过滤。
+但如果有index，则差别会非常大，这个cost计算方式就会生效。
+
+*完成SQL语句编译后，把最左边的join table作为topTableFilter，然后从它开始进行循环。
+*先读入TableA一列数据（实际读入整个block），然后b再根据id利用索引搜索，找出所有相同id的列。
+foreach tableA as rowA
+ foreach tableB as rowB
+  if (rowB.id == rowA.id) {
+    result.addRow(rowA,rowB);
+  }
+
+*H2的inner join/left, right join的on子句都是可选的。如果没有on子句，效果就和cross join一致。
+
+
+condition push down & filterCondition
+------
+select a.id, b.v1 from test a join test2 b on a.id = b.id where a.name >= 'aaa' and a.id <= 99 and b.v1 = 39 and b.v2 >= 'aaa'
+select a.id, b.v1 from test a join test2 b on a.id = b.id where a.name >= 'aaa' and a.id = 99 or b.v1 = 39 or b.v2 >= 'aaa'  （可以考虑会出现什么判断，注意OR）
+
+原理：
+为了提高join的效率，在嵌套循环中，可以把condition push down到join表中，这样就可能减少join的次数，提高效率。另外，对于最后一个join表，则不需要这个优化，因为已经完成了join，最终还是会到condition的过滤，不需要filterCondition的提前过滤。
+
+流程：
+1、条件上推（Parser阶段）。Parser.parseJoinTableFilter把非outer join的joinCondition（a.id = b.id）添加到Select.condition中，Parser.parseSelectSimple把where的条件加入到Select.condition中。这样就把所有的condition上推到顶层Select中。
+2、索引条件下推（准备阶段）。Select.prepare中，所有的TableFilter会根据Select的condition判断是否适合创建IndexCondition（Index遍历需要）。
+3、cost计算（优化阶段）。Select.preparePlan过程中，首先push所有Select的condition到每个TableFilter的fullCondition中，然后Optimizer.optimize()优化过程计算所有A(n,n)的join组合，这个过程会参考indexCondition进行cost的计算，最后选择最小cost的join组合作为执行plan。
+4、fullCondition下推（优化阶段）。主要把满足条件的fullCondition下推到filterCondition（在嵌套循环中过滤，Plan.optimizeFullCondition）。大致要求condition的表达式必须是evaluatable，也就是如果涉及别的表的列表达式，则该表达式必须是较前join顺序的表。另外对于AND的condition，可以left和right分别判断是否符合条件，但对于OR的condition，必须是左右同时满足evaluatable（可以仔细想想为什么，因为OR的话，如果仅仅left符合，但不确定是否可以filter，所以必须left和right均一起添加到filterCondition才有意义，但AND则可以left或者right符合，则可以判断是否filter）。
+
+结果：
+在上面例子最终选择的join顺序为（B,A）：具体如下
+TableFilter b的filterCondition为((B.V2 >= 'aaa') AND (B.V1 = 39))
+，同时index为PageBtreeIndex（v1, v2），indexCondition为((B.V2 >= 'aaa') AND (B.V1 = 39))
+TableFilter a的filterCondition是NULL，同时index为scanIndex，indexCondition为a.id = b.id。
+Select的condition为
+((A.ID = B.ID) AND ((B.V2 >= 'aaa') AND ((B.V1 = 39) AND ((A.NAME >= 'aaa') AND (A.ID <= 99)))))
+之所有选择B,A，是因为当B作为topTableFilter的时候，A就可以利用scanIndex进行join匹配，这时候由于是EQUAL，所以cost比id <= 99的范围要少得多，因此就选择了B，A。
+
+virtual table join
+------
+select a.id, b.v1 from test a join (select * from test2 where id = 99) b on (a.id = b.id)  where b.v1 <= 99  
+（深入优化：可以考虑把id >= 99 上推到外层的select，然后再下推到test中）
+
+select a.id, b.v1 from test a join (select * from test2 where id <= 99) b on (a.id = b.id)  where a.id <= 99
+（indexConditions和filterCondition都包括相同的a.id <= 99，H2的优化不足，没有取出冗余条件）
+
+总体流程和上面的condition push down & filterCondition差不多，关键是内层的Select看成virtual table，table为TableView，视图。
+
+过程：
+-外层Select解析为TableFilterA和TableFilterB。TableFilterB（内部的table为TableView，视图。同时包含内层的Select语句），就是把内层Select解析成一个virtual table。（内层Select解析的过程有点麻烦（待深入））
+-条件上推。外层Select的condition为 a.id = b.id and b.v1 <= 99
+-索引条件下推。TableFilterA的IndexCondition为 a.id = b.id。TableFilterB的IndexCondition为 a.id = b.id和v1 <= 99。
+-计算cost。同样是列出所有的排序顺序A(n,n)，然后通过公式cost = costA + costA * costB计算cost。另外还会push顶层的condition到TableFilterA, TableFilterB的fullCondition。
+-计算TableFilterB的cost（ViewIndex.getCost）。首先将内层的Select语句再次解析到Select q，然后根据传入的索引masks，往q传入参数指定的列和对应的参数，把a.id = b.id and b.v1 <= 99 转换为 TEST2.ID IS ?1 AND TEST2.V1 <= ?2，添加到q的condition。（Select.addGlobalCondition）。这时q的condition变为id >= 99 and TEST2.ID IS ?1 AND TEST2.V1 <= ?2，然后重新取出q的SQL语句，重新对该SQL语句进行解析编译，根据刚刚的condition进行解析，cost计算等，获取了新的select对象q。对于该例子，还是选取了id is ?1以及id >= 99同时作为IndexCondition。
+-经过分析后，执行条件就显而易见：TableFilterA作为外层循环，通过scanIndex得出row，然后，TableFilterB作为内层循环，通过id is ?1 以及 id >= 99的indexConditions获取每次搜索的范围，然后利用索引查找对应的join的row，这里TableFilterB的索引是ViewIndex，负责了把id is ?1的条件转换为每次循环的实际值，也就是A的id。然后还要经过内层Select的condition过滤。
+-另外有一个有趣的是，如果把内层的select的condition改为id = 99，此时则会是TableFilterB作为外层的循环，TableFilterA变成内层循环，具体cost计算可以参考下面，主要是因为TableFilterB为外层循环的时候，v1 = 99的EQUAL条件可以令cost大大降低，于是总的cost也大大降低
+id >= 99
+A  10206.9          29.85
+B  30.096           19055.708
+   317424           587899
+
+id = 99
+A  10206.9        29.85
+B   30.096        30.086
+     317424       959
+
+select a.sid, b.v1 from (select sum(id) as sid from test where id >= 30 group by name) a join (select * from test2 where id >= 99) b on (a.sid = b.id);
+-在计算TableFilterA的cost中，把顶层Select的condition下推的时候，该select子句是group by查询，并且参数指定的列不在group by的列中，会直接把该参数条件转换为having子句。即会变成
+SELECT SUM(ID) AS SID FROM PUBLIC.TEST WHERE ID >= 30 GROUP BY NAME HAVING SUM(ID) IS ?1
+
+结构：
+Select  (select a.id, b.v1 from test a join (select * from test2 where v1 >= 99) b on (a.id = b.id))
+  condition (A.ID = B.ID)
+  TableFilter (A)
+    indexCondition (null)
+    RegularTable (A)
+    PageDataIndex (scanIndex)
+  TableFilter (B)
+    indexCondition (A.ID = B.ID)
+    TableView (B)
+      ViewIndex
+    ViewIndex
+      Select (SELECT TEST2.ID,TEST2.V1,TEST2.V2,TEST2.V3 FROM PUBLIC.TEST2 WHERE (V1 >= 99) AND (TEST2.ID IS ?1))
+        condition (v1 >= 99 and test2.id is ?1)
+        TableFilter (test2)
+          indexCondition (ID is ?1)
+          RegularTable (test2)
+          PageDelegateIndex (scanIndex wrap)
+
+left outer join
+------
+select a.id, b.v1 from test a left outer join test2 b on (a.id = b.id)  where b.v1 <= 99 and a.name >= 'aa'
+
+由于left outer join不能决定了join的顺序，因此对比之前的join有了一定的限制：
+-topFilters只有TableFilter A，并且a.id = b.id也没有上推到外层Select的condition，这是由于上推是为了在计算cost的时候对于不同join顺序，计算对应的cost，但现在只计算一个顺序，因此不需要上推。（Parser.parseJoinTableFilter, isOuter = true）
+-另外对于outer join后面的表，只有原来的a.id = b.id，不会从Select的condition中创建indexConditions（索引条件下推），因为下推可能会影响结果。可以假设下推条件到B，如果B过滤了某些行，但是一样可以产生join结果，只不过在对应B的列为NULL，这时就等于过滤失败。具体可以参考下面的SQL：
+select p, c from parent left outer join child on p = pc where c is null;
+-计算cost的时候，只计算A，B的顺序，并且TableFilterB被计算了两次，可能有BUG。
+-fullCondition下推到filterCondition的时候，对于TableFilterB不会执行（并且也没有意义），这和前面索引条件不能下推的理由一样。
+
+*执行Plan大致为：TableFilterA使用scanIndex，filterCondition为a.name >= 'aa'，indexConditions为NULL；TableFilterB使用PRIMARY_KEY_INDEX，indexConditions为a.id = b.id，joinCondition为a.id = b.id，filterCondition为NULL。
+*过程：A先遍历出一行，然后B遍历，首先根据主键索引找出对应的行，然后通过joinCondition过滤（a.id = b.id使用了两次，此处的joinCondition应该是冗余），如果B找不到row，则会设置为NULL row。B遍历完毕，返回到顶层的Select，Select的condition过滤后，将投影的列的值从对应的A、B取出。
+
+right ouer join
+------
+select a.id, b.v1 from test a right outer join test2 b on (a.id = b.id)  where b.v1 <= 99 and a.name >= 'aa'
+三个TableFilters：B, SYSTEM_JOIN_78(DUAL table，一行一列), A
+SYSTEM_JOIN_78作为一个DUAL table，类似一个proxy，进行nested join的查询。
+
+外层Select的condition为b.v1 <= 99 and a.name >= 'aa'；
+B的indexConditions为v1 <= 99，filterCondition也为v1 <= 99，index为PageBtreeIndex（v1，v2），join为SYSTEM_JOIN_78；
+SYSTEM_JOIN_78的joinCondition为a.id = b.id，index为RANGE_INDEX (实际不会用到)，nestedJoin为A，joinOuter=joinOuterIndirect=true；
+A的index为主键索引，indexConditions为a.id = b.id，另外fullCondition为NULL, joinOuterIndirect=true, joinOuter=false。
+
+SYSTEM_JOIN_78进行类似nested join的查询，当调用next()的时候，会调用nestedJoin.next()进行查询。
+
+natural join
+------
+select a.id, b.v1 from test a natural join test2 b where b.v1 <= 99 and a.name >= 'aa'
+natural join与inner join类似，注意亮点：
+1、Select中出现*这个通配符需要去除a和b的相同列b.id，2、自动添加condition a.id = b.id。
+其余都与采用a.id = b.id的inner join一致，即同样的condition下推，join顺序优化，索引选择等。
+
+cross join
+------
+select a.id, b.v1 from test a cross join test2 b where b.v1 <= 99 and a.name >= 'aa'
+cross join流程与inner join类似，就是没有了inner join的on condition（a.id = b.id），同样又condition下推，join顺序优化，索引选择等。
+
+
+nested join
+------
+select a.id, b.v1, b.v3 from test a join test2 b on a.id = b.id and a.name = b.v2 
+left outer join test3 c
+join test4 d on (c.id = d.id)
+on (a.id = c.id) where a.name >= 'a';
+
+通过移动on子句的位置，可以改变join的顺序，对于inner join结果一样，但outer join会有差别。可以通过配置来控制是否支持netsed join，具体通过在URL中添加配置，如"jdbc:h2:test;;NESTED_JOINS=FALSE"，则会关闭此特性的解析。
+关于nested join的实现，主要看TableFilter.next()中的循环（就是nested loop对于每个TableFilter的一次循环，代码写得比较复杂）：
+1、如果没有nestedJoin表，则首先当前TableFilter通过索引查找出合适条件一行，否则，调用nestedJoin.next()，即让nestedJoin进行迭代；
+2、如果前面当前TableFilter无法查找适合条件一行，则退出当前循环；如果nestedJoin.next()返回false，即同样没有找到合适的行，并且为outer join且之前没有找出符合的一行，则设置当前行为NULL行。
+3、filterCondition过滤（join前过滤），如果不符合条件则会退出循环。注意nested Join的filterCondition为NULL，则肯定符合条件。
+4、joinCondition过滤（join后过滤），如果不符合条件则会退出循环。
+5、join.next()。如果join.next()返回false，即没有找到合适的行，则退出当前循环。
+
+
+以下针对outer join进行讨论：
+nestedJoins=true：
+则会解释为
+(A join B) left ouer join (C join D)
+Parser解析为：
+A join B outer join SYSTEM_JOIN_XXX nested join C join D
+left outer join当遇到nested join的时候会借助SYSTEM_JOIN_XX进行nested join循环的辅助。
+
+nestedJoins=false:
+解释为：
+A join B outer join D outer join C
+Parser解析为：
+A join B join D(outer:true) join C(outer:true)
+另外，以上的SQL由于C放在后面，因此d on (c.id = d.id)中的c.id无效，解析会失败。
+
+如果将left outer join改为right outer join，则：
+nestedJOins=true，解释为：
+(C join D) outer join (A join B)
+Parser解析为：
+C join D outer join SYSTEM_JOIN_XX nested join A join B
+right outer join无论是否有nested join都会借助SYSTEM_JOIN_XX进行nested join循环的辅助。这里与left outer join不同，因为left outer join是在判断nested && joined后可以直接往left outer join的右边添加SYSTEM_JOIN_XX，right outer join需要往中间添加SYSTEM_JOIN_XX，为了方便，因此right outer join的右边不会判断是否存在nested join，直接往中间添加。具体可以参考Parser.readJoin()。
+
+nestedJOins=false，解释为：
+C join D outer join A outer join B
+Parser解析为：
+C join D outer join A outer join B
+
+
+Join的解析 ＋ condition作用总结
+------------
+Praser.readJoin
+从左到右解析join：
+如果cross join, natural join, inner join，则可以任意组合join顺序，也不改变topTableFilter，并且可以condition下推等优化。
+如果left outer join，则左边的表以及之后的所有TableFilter的join顺序就会被固定，但不会改变topTableFilter，不可执行condition下推的优化。
+如果right outer join，则把topTableFilter转为右边的表，并且整个join顺序都不能再改变，并且会创建SYSTEM_JOIN_xxx表进行join辅助。
+--尤其要注意的是outer join对join顺序限制，仔细考虑为什么是这样的规则，具体原因是join顺序改变会对结果造成影响。
+
+
+注意：
+一致：
+select * from test5 a join test6 b on (a.id = b.id) where a.name = b.name;
+select * from test5 a join test6 b on (a.id = b.id and a.name = b.name);
+
+不一致：
+select * from test5 a left outer join test6 b on (a.id = b.id) where a.name = b.name;
+select * from test5 a left outer join test6 b on (a.id = b.id and a.name = b.name);
+因此在left outer join中，不能把where的条件子句下推到B.joinCondition/B.indexCondition，会影响结果。
+
+
+join, outer join的condition总结：
+Select.condition是查询结果加入结果集前的过滤条件，最后的过滤；indexCondition一般是索引查找过程的条件；filterCondition一般是where的条件子句，主要用于join之前的过滤；joinCondition一般是on的条件子句，主要用于join之后的过滤。由于outer join的限制，包括优化存在，这三个condition有可能为NULL。
+
+select a.id, b.v1, b.v2 from test a right outer join test2 b on a.id = b.id and a.name = b.v2 join test3 c on (a.id = c.id) where b.v3 >= 'a'
+
+0、初次编译。根据join顺序，给join表B的join和joinCondition赋值。即A.join = B, B.joinCondition = (a.id = b.id and a.name = b.v2)。然后会让join表B对on表达式的条件尝试创建indexConditions（TableFilter.mapAndAddFilter）。另外注意：
+inner join： A.isJoinOuter() == A.isJoinOuterIndirect() == B.isJoinOuter() == B.isJoinOuterIndirect() == false；
+left outer join： A.isJoinOuter() == A.isJoinOuterIndirect() == false； B.isJoinOuter() == B.isJoinOuterIndirect() == true；
+right ouer join：
+1、条件上推（Parser阶段）。对于inner join、natural join，Parser.parseJoinTableFilter把join的joinCondition（a.id = b.id）添加到Select.condition中，Parser.parseSelectSimple把where的条件加入到Select.condition中。这样就把所有的condition上推到顶层Select中。另外，在这阶段，同时把所有非outer join的TableFilter都成为topTableFilters，表明可以更改join顺序。（outer join不参与，condition只包含where部分）
+2、索引条件下推（准备阶段）。Select.prepare中，对于!isJoinOuter() && !isJoinOuterIndirect()的TableFilter会根据Select的condition判断是否适合创建IndexCondition（Index遍历需要）。
+3、cost计算（优化阶段）。Select.preparePlan过程中，首先push所有Select的condition到每个TableFilter的fullCondition中，然后Optimizer.optimize()优化过程计算所有A(n,n)的join组合，这个过程会参考indexCondition进行cost的计算，最后选择最小cost的join组合作为执行plan。
+4、fullCondition下推（优化阶段）。主要把满足条件的fullCondition下推到filterCondition（在嵌套循环中过滤，Plan.optimizeFullCondition）。大致要求condition的表达式必须是evaluatable，也就是如果涉及别的表的列表达式，则该表达式必须是较前join顺序的表。另外对于AND的condition，可以left和right分别判断是否符合条件，但对于OR的condition，必须是左右同时满足evaluatable（可以仔细想想为什么，因为OR的话，如果仅仅left符合，但不确定是否可以filter，所以必须left和right均一起添加到filterCondition才有意义，但AND则可以left或者right符合，则可以判断是否filter）。（isJoinOuter() == true不参与）
+
+inner join可以对A、B进行filterConditions、indexConditions优化，left outer join只会对A进行filterConditions、indexConditions优化。
+
+BUG:
+1、Select.condition不会对已经下推的condition进行删除，所以会有不必要的冗余过滤。
+2、Plan.calculateCost()根据每个join顺序的plan中，循环是根据join顺序中每个表计算cost。但如果是outer join则join顺序已经固定，因此循环里应该是join顺序固定好的filters，而不是allFilters，不必要遍历其它join顺序。目前在循环的时候，allFilters为filters中的表才是有效的PlanItem，outer join固定了join顺序后，会递归计算join表的cost，而不再需要在循环里再次计算cost。
+即allFilters是包括A，B，C，但事实上只要计算B的时候，会递归计算SYSTEM_JOIN_XX，A，C，具体如下：
+
+B -join-> SYSTEM_JOIN_XX -nestedJoin-> A
+                         -join->       C
+A
+C
+
+3、Plan.removeUnusableIndexConditions()同样也是allFilters应该转换为filters？
+
+
+multi-table mixed join
+------
+select a.id, b.v1, c.v2 from test a right outer join test2 b on (a.id = b.id) right outer join test_btree c on (c.id = a.id) where b.v1 >= 99 and a.name >= 'a' and c.id1 >= 'aa'
+
+TableFilters: C --join--> SYSTEM_JOIN_130 --nestedJoin--> B --join--> SYSTEM_JOIN_83 -->nestedJoin--> A
+其中，除了C以外，joinOuterIndirect均为true。
+
+
+select a.id, b.v1, c.v2 from test a join test2 b on (a.id = b.id) join test_btree c on (c.id = a.id) where b.v1 >= 99 and a.name >= 'a' and c.id1 >= 'aa'
+A join B join C，和之前流程一致，计算所有的join顺序的cost，然后选出最小的join顺序。注意上面特殊例子中，两个join条件，a.id = b.id和c.id = a.id，优化器会添加b.id = c.id到condition，能产生更有效的执行plan。
+cross join、natural join、inner join都不会因为join顺序影响，可以通过计算不同join顺序的cost得出最优执行plan。
+
+
+union/union all/except/intersect
+------
+select a.id, b.v1 from test a cross join test2 b where b.v1 <= 99 and a.name >= 'aa'
+union/union all/except/intersect
+select a.id, b.v1 from test a left outer join test2 b on (a.id = b.id)  where b.v1 <= 99 and a.name >= 'aa'
+
+SelectUnion，unionType可以为UNION（并集去重）, UNION_ALL（并集）, EXCEPT/MINUS（left中不包括right）, INTERSECT（交集）
+有left和right两个select对象，根据unionType分别对left和right进行query，还有结果集LocalResult的处理。
+查询前准备：
+对于UNION和EXCEPT，要求left和right采用distinct查询，以及LocalResult设置distinct处理，INTERSECT则需要left和right采用distinct查询，UNION_ALL忽略。
+查询后处理：
+UNION_ALL添加结果集即可，UNION通过addRows添加left和right结果集同时进行distinct处理，EXCEPT先添加left结果集同时进行distinct处理，然后去掉right的结果集中相同的部分。INTERSECT需要创建一个临时结果集，先把left结果集添加到temp同时进行distinct处理，然后查看right结果集中，如果包含在temp中则添加到返回的结果集里。
+
+
+
+FOR UPDATE
+
+//insert
+======================================
+=============== insert ===============
+======================================
+
+//delete
+======================================
+=============== delete ===============
+======================================
+
+
+TODO:
+
+Select
+//order by --  TimSort!!  http://svn.python.org/projects/python/trunk/Objects/listsort.txt
+//MVCC ? 
+
+
+//TCP server
+// memtable
+
+//FOREIGN KEY
+
+//MVStore engine
+
 
 
