@@ -1,12 +1,13 @@
 == TCP server ==
 1. 每个客户端连接产生TcpServerThread线程
 2. 每个数据库产生WriterThread（负责定时flush）以及FileLock对象（Lock method）
+3. 每个TcpServerThread线程有一个用户Session
+4、每个连接（Session）一次启动一个事务中，每个事务可以由多个QUERY、UPDATE的statement组成，执行statement都会发送到Server端。默认情况下，Server端只允许一个session给同一个database执行statement，所以每次执行statement都会对database进行synchronized（可以设置MULTI_THREADED属性，这样就允许多个session同时执行statement，所以是对session进行synchronized，但不确保该特性稳定）。为了确保不同连接之间的事务保持ACID，H2使用table lock机制。
+5、每个连接一次只能打开一个数据库
+
 
 Database相关：
 *每个DataBase对象有一个PageStore对象表示Database文件的页集合。
-*PageStore是整个Database的存储层抽象；包含FileStore对象，封装随机访问文件的功能，包含CacheLRU对象，利用LRU算法缓存Page数据
-*PageStore同时负责通过PageId读取底层文件中不同类型的Page（如PageDataLeaf,PageDataNode, PageBtreeLeaf, PageBtreeNode等）。
-*FileStore对象可以根据实际情况修改底层访问，如FileDisk、FileMem等
 
 *创建PageStore的时候，会从文件的Page 4读取meta table的root page数据(其中包括所有表的索引的indexId和对应的rootPageId)
 *然后创建Public.SYS. Public.SYS保存创建其它元数据表的SQL语句
@@ -24,6 +25,53 @@ DataBase
    |
    |--CacheLRU
    |--FileStore
+
+
+PageStore相关：
+*PageStore是整个Database的存储层抽象；包含FileStore对象，封装随机访问文件的功能，包含CacheLRU对象，利用LRU算法缓存Page数据
+*PageStore同时负责通过PageId读取底层文件中不同类型的Page（如PageDataLeaf,PageDataNode, PageBtreeLeaf, PageBtreeNode等）。
+*PageStore也负责本Database的undo log的操控。
+*FileStore对象可以根据实际情况修改底层访问，如FileDisk、FileMem等
+
+-初始化的时候，从Page0读取固定文件头，初始化pageSize、freeListPagesPerList、fileLength、pageCount；接着需要读变量文件头readVariableHeader，首先校验Page1的checksum，如果校验失败，则尝试读Page2，如果都失败则文件损坏。从可变文件头读取，logKey、logFirstTrunkPage、logFirstDataPage等undo日志相关的值。然后初始化PageLog。Page0，Page1，Page2都不会被cache。
+
+-PageFreeList。
+使用1 bit表示页是否在使用。pageSize为2048的时候，一个PageFreeList就可以表示2045 * 8 = 16360页，总共可以表示约32MB的数据，当pageID超过16360 + 3的时候，则会重新分配PageFreeList，负责表示后面的16360页是否使用。内部用used的BitField代表已经使用的页，注意从Page4开始计算used的值。
+PageStore包括一个PageFreeList数组。
+
+Page类型：
+TYPE_EMPTY = 0;          //An empty page.
+TYPE_DATA_LEAF = 1;      //A data leaf page (without overflow: + FLAG_LAST)
+TYPE_DATA_NODE = 2;      //A data node page (never has overflow pages).
+TYPE_DATA_OVERFLOW = 3;  //A data overflow page (the last page: + FLAG_LAST).
+TYPE_BTREE_LEAF = 4;     //A b-tree leaf page (without overflow: + FLAG_LAST).
+TYPE_BTREE_NODE = 5;     //A b-tree node page (never has overflow pages).
+TYPE_FREE_LIST = 6;      //A page containing a list of free pages (the last page: + FLAG_LAST).
+TYPE_STREAM_TRUNK = 7;   //A stream trunk page.   PageLog日志使用
+TYPE_STREAM_DATA = 8;    //A stream data page.    PageLog日志使用
+
+
+文件中Page分布：
+Page 0:
+固定文件头。
+HEADER、pageSize、writeVersion、readVersion
+
+Page1:
+变量文件头。
+checksum、writeCountBase、logKey、logFirstTrunkPage、logFirstDataPage
+
+Page2:
+Page1的备份，当checksum无效的时候会被读取。
+
+Page3:
+PAGE_ID_FREE_LIST_ROOT
+freeList的root。
+
+Page4:
+元数据表metaTable（PAGE_INDEX表）的数据页。
+负责内部表初始化。
+
+Page5 -- logFirstTrunkPage（1067？） 中都为数据页或者索引页
 
 
 (以下开始索引的讨论，暂时忽略用于地理坐标的spatial类型的index)
@@ -60,7 +108,7 @@ layout:
 entries (child page id: int, key: varLong)
 
 PageDataLeaf
---int[] offsets     row offsets
+--int[] offsets     row offsets to read data
 --Row[] rows        the rows
 layout:
 list of key / offset pairs (key: varLong, offset: shortInt)
@@ -89,6 +137,8 @@ data (key: varLong, value,...)
 *XNode类是内部结点，XLeaf类作为叶子结点
 *内部成员rootPageId所指示索引页，如果数据量少，则指定一个XLeaf，数据量大，rootPageId则指定XNode。
 *结构都是由多层XNode内部结点到最后XLeaf叶子结点的树。
+*PageDataNode保存keys和对应的childPageIds；PageDataLeaf保存keys和对应的offsets，以及data保存row的全部列值。PageDataNode中keys[0]是childPageIds[0]中最大的rowKey，并且keys大小为entryCount，childPageIds大小为entryCount+1，最后一个childPageIds为最右边的子页。
+*PageBtreeNode保存keys（SearchRow）和对应的childPageIDs；PageBtreeLeaf根据情况可能保存row的key或者row的全部值。
 
 
 ====  PageDataIndex/PageDataNode/PageDataLeaf ====
@@ -97,7 +147,6 @@ data (key: varLong, value,...)
 *primary key符合条件（单列，并且类型是long,int,short,byte）时，primary key的Index类就简单封装PageDataIndex，同时PageDataNode/PageDataLeaf保存的keys就是primary key的值，否则parimary key的Index类就是PageBtreeIndex类，PageDataNode/Leaf保存的keys数组是对应每个row的自增值。
 
 *PageDataNode保存Keys和对应的childPageIds表示子页PageDataLeaf/PageDataNode的pageId，查找key时，通过二分查找找到对应的子页的pageId。然后通过PageStore获取对应的子页
-
 *PageDataLeaf内部保存Key和对应的offset。keys数组表示保存的key，offsets数组表示成员变量data里面每个key对应的数据offset。data保存的数据是row的全部列的值。
 
 
@@ -106,8 +155,8 @@ data (key: varLong, value,...)
 *PageBtreeNode与PageDataNode类似，代表的是B树的内部结点，PageBtreeLeaf则是其B树的叶子结点。
 
 *onlyPosition成员变量，指示data是否只保存row的key，注意key为scanIndex所表示的key，即可能为primary key或者内部自增key。默认false。
- true，则获取row的时候，需要通过offset获取data里面的key，然后通过RegularTable的scanIndex去查找对应的row的所有列的数据（同样利用二分查找）。由于需要scanIndex查找，产生更多的I/O。
- false，则获取row的时候，直接通过offset获取data里面的数据，也就是row对应所有 索引列 的数据。注意只是索引列。直接从内存中data数据获取，不要消耗I/O。
+ onlyPosition = true，则获取row的时候，需要通过offset获取data里面的key，然后通过RegularTable的scanIndex去查找对应的row的所有列的数据（同样利用二分查找）。由于需要scanIndex查找，产生更多的I/O。
+ onlyPosition = false，则获取row的时候，直接通过offset获取data里面的数据，也就是row对应所有 索引列 的数据。注意只是索引列。直接从内存中data数据获取，不要消耗I/O。
  一般在PageBtreeNode插入新的childPage，或者PageBtreeLeaf插入新的row的时候data空间不足的时候可能会令onlyPosition=true，另外还要考虑split的情况。(TODO)
 
 *PageBtreeNode/Leaf在二分查找的时候，根据row的索引列进行Value值对比：首先根据两个比较类型，按照规则转换到同一个指定类型，然后进行比较。
@@ -132,8 +181,6 @@ Parser.parse(String sql)
 ======================================
 =============== Select ===============
 ======================================
-
-
 *Select命令执行的时候，每个表用TableFilter表示，每个TableFilter只能有一个index。
 *TableFilter有IndexCursor cursor对象，方便利用PageIndex对象进行迭代查询
 
@@ -554,7 +601,7 @@ Praser.readJoin
 --尤其要注意的是outer join对join顺序限制，仔细考虑为什么是这样的规则，具体原因是join顺序改变会对结果造成影响。
 
 
-注意：
+outer join不能随意下推condition：
 一致：
 select * from test5 a join test6 b on (a.id = b.id) where a.name = b.name;
 select * from test5 a join test6 b on (a.id = b.id and a.name = b.name);
@@ -621,13 +668,221 @@ SelectUnion，unionType可以为UNION（并集去重）, UNION_ALL（并集）, 
 UNION_ALL添加结果集即可，UNION通过addRows添加left和right结果集同时进行distinct处理，EXCEPT先添加left结果集同时进行distinct处理，然后去掉right的结果集中相同的部分。INTERSECT需要创建一个临时结果集，先把left结果集添加到temp同时进行distinct处理，然后查看right结果集中，如果包含在temp中则添加到返回的结果集里。
 
 
-
-FOR UPDATE
+***
+Select总结：Select的实现由于仅支持nested loop，扩展性极差，是属于面向过程的实现；对于condition的优化不够好，loop过程中有一些重复的condition。可以参考PostgreSQL的执行流程，让一些诸如scan、sort、join的操作对象化，组成类似树的结构。另外对于condition优化，应该参考Hive的树遍历机制，整理condition。
+尽量不要用right outer join，不要用in子查询（join+distinct替代），
 
 //insert
 ======================================
 =============== insert ===============
 ======================================
+insert into test4 values(14, 14);
+
+流程：
+1、Parser解析
+2、Insert.prepare()进行简单的优化。对values表达式每个进行简单优化，或者调用select.prepare()优化select的表达式
+3、Insert.update()执行命令。
+
+
+insert into test4 values(13, 13);
+-Insert.insertRows()
+..将values列表的值按照插入对应的Column定义的类型进行转换，然后对每一行插入数据进行操作：按照默认值更新NULL值，检查插入值限制，精度转换，Sequence值更新操作。
+..table.lock锁表
+..RegularTable.addRow。循环该table的所有index添加row。具体调用index.add()。另外这里有个trick，如果更改次数超过一定，则会取一定数量的列作为sample，然后创建SQL查询每列的selectivity，然后更新每列的selectivity（RegularTable.analyzeIfRequired()）。
+..Session.log()。往session的undoLog添加undo log（与PageLog不同）。主要用于事务roll back。
+-Session.commit()
+往PageLog写入commit日志，包括当前session的id，表示当前session提交事务。
+接着清空undoLog。
+unlock所有在Session保存的锁表locks中的锁。
+
+
+*index.add()实现 (PageDataIndex、PageBtreeIndex)：
+PageDataIndex ：
+把row插入rootPage，然后计算出split point，如有需要则split该rootPage，rootPage有可能是Leaf或Node。注意split rootPage的时候，为了不改变rootPageId带来的负担，更改原来rootPage的pageID，然后再原来的rootPageID上创建新的PageDataNode。split完成后，然后需要重新插入查找插入位置，再进行插入操作。
+然后更新rowCount，然后调用PageStore.logAddOrRemoveRow()，让当前session记录当前logSectionId，logPos作为第一个没提交的事务记录。然后往PageLog写入type为ADD的日志并输出到PageOutputStream。
+
+PageBtreeIndex：
+add方法基本一致，但不需要后面的logAddOrRemoveRow（PageDataIndex必定已调用）
+
+插入row到PageDataLeaf、PageDataNode、PageBtreeLeaf、PageBtreeNode：
+主要有两个方法addRowTry()、split()。4个页类型都有自己的实现，addRowTry()主要是添加row到该页，并且返回split point。split()则是split page，创建新的兄弟叶子结点。
+
+----
+-PageDataLeaf
+addRowTry()
+修改之前，要写入undo日志。undo日志是以page为单位，格式为[type(UNDO), pageId, pageData]，pageData会经过LZF压缩。（PageStore.logUndo()）注意这里并没有flush操作，undo日志仍然可能在内存中；接着然后判断添加row是否会溢出页面大小（添加的row是从底部向上的，因此只需要判断最后的offset - row长度 < start + keyoffset）：
+..没有溢出
+如果之前没有数据，或者插入后不会溢出。首先通过二分查找找出insert point，然后往offsets数组插入新的offset，注意offsets中插入点后面的值要偏移。接着往keys，rows数组插入row的key以及row。然后调用PageStore.update()更新该page，主要是在对应的PageFreeList设置used的标志，然后更新一下CacheLRU的链表。接着要更新page的数据data，把数据从insert point开始前移rowLength（逆序增加），然后在insert point写入row。最后返回-1作为split point，表示不需要后续的split操作。
+..插入前有数据，并且插入后溢出：
+需要增加新的Leaf结点作为兄弟，按照insert point的大小，有3种情况：
+1.entryCount/3
+如果insert point位于[0, entryCount/3)，则split point为entryCount/3；
+如果位于[entryCount/3, 2*entryCount/3)，split point为insert point；
+如果位于[2*entryCount/3, entryCount - 1]，split point为2*entryCount/3。
+由于Leaf页保存row的数据，比单纯保存keys要大，因此这个方式可以保证split point比较接近insert point的同时，也保证split之后page至少包括entryCount/3，确保一个更好的页面利用率。
+2.entryCount/2
+如果insert point<5的时候（<= 5 ?），entryCount/3的算法并不能保证更好的分配，因此split point只为entryCount/2。
+3.insert point
+如果sortedInsertMode为true，则insert point为split point。按照不同情形直接返回对应的split point，不进行插入row操作。
+..插入前没有数据，插入row后溢出，即rowLength大于页大小，需要写overflow page。具体就是，首先把row的部分复制到page剩下的空间，然后根据剩下大小分配PageDataOverflow页，然后继续把剩下的复制进去，如果仍然不足，继续分配PageDataOverflow页，继续填充该页，直到把rowLength充满位置，注意PageDataOverflow之间都有parentPageId、nextPage代表前后页的pageID，另外当前PageDataLeaf页也有保留第一个PageDataOverflow的pageID。要注意的是，为了方便后面的读操作，有SoftReference直接对该row的引用，避免要遍历PageDataOverflow读取数据。
+split()。
+分配并创建新的PageDataLeaf，然后把范围[split point, entryCount - 1)的数据添加到新的叶子结点，然后删除这段范围的记录。删除前写入undo日志，然后偏移页数据data覆盖旧值，以及修改offsets、keys、rows数组。返回创建的新页。
+
+-PageDataNode
+addRowTry()
+写入undo日志。然后是一个循环，需要不断循环尝试查找插入点，如果遇到split则先split后再查找，直到不需要进行split可直接插入row为止。具体为：
+二分查找插入点，选择插入点的子page，调用page.addRowTry()，进行递归查找，直到叶子结点调用addRowTry添加row。如果子page需要进行split操作，表示当前页也需要进行插入row。需要判断是否溢出，这里的逻辑比Leaf简单，具体为
+如果溢出，则直接返回entryCount/2作为split point。（由于Node结点只包括key值，不需要考虑页面利用率）
+如果没有溢出，首先取出子page的split point - 1的位置的key作为pivot，然后子page.split()出新的兄弟页page2，然后PageStore.update()更新该page,page2的相关缓存信息，接着调用addChild()把page2插入，pivot作为key作为新的子page。然后再PageStore.update()更新当前Node页的相关缓存信息。split完成后，返回循环开始，再重新查找插入点。
+成功插入row后更新行数＋1。
+split()
+分配并创建新的PageDataNode。把[split point, entryCount - 1)的数据添加到新的PageDataNode，并且从该页删除。删除前同样写入undo日志，然后修改pages、childpageIds数组。
+要注意对于PageDataNode，keys[0]是childPageIds[0]中最大的rowKey，并且childPageIds大小为entryCount+1，最后一个childPageIds为最右边的子页。因此childPageIds是从split point + 1开始移动到新的子页。最后并且要注意把新的PageDataNode的子页重新设置parent为自己。
+
+-PageBtreeLeaf
+addRowTry()
+基本和PageDataLeaf一致，在溢出的时候，会令onlyPosition为true，只保存position。
+split()
+基本和PageDataLeaf一致。
+-PageBtreeNode
+基本和PageDataNode一致。
+
+总结：
+PageDataIndex插入row，具体为：
+查找插入点      -->     是否进行split操作 -不需要split-> 插入row。
+           <-需要split-
+
+查找插入是从根到叶，split操作是从叶到根的遍历。
+
+首先从rootPage开始利用二分搜索查找插入点，一直遍历到底层的PageDataLeaf。如果PageDataLeaf溢出，则从split point创建兄弟结点，然后父PageDataNode则会尝试增加它的兄弟。这样相当于向父结点插入新的值。如果父结点已满，则递归向其父结点PageDataNode请求插入，如果一直递归到PageDataIndex，则需要新增PageDataNode作为rootPage根索引页，层数增加1。然后重新查找插入点，直到不需要进行split成功插入为止。
+
+存在问题：
+1.插入row非常大的时候（超过pageSize），按照entryCount/3的算法有可能不断split page，直到split出空页，然后再插入该空页以及分配overflow页，这样会导致大量的低利用率的page产生。（使用CLOB类型）CLOB根据大小，如果数据不大，则保存内存并直接把数据写入用户表；如果数据太大，则写入专门的LOB表，通常是把数据压缩后插入，同样需要overflow页保存数据，然后获取LOB表中对应的id，把这个id插入用户表。
+2.需要先split，然后再insert，考虑如何同时完成split以及insert操作。
+
+
+*h2的insert into...select...扩展语法
+insert into xxx [direct/sorted] select ...
+默认Select的结果保存到结果集中，默认在内存中，如果结果集太大，可能写入临时文件，或者建立临时表（需要随机访问结果集）。然后遍历结果集，作为insert的输入，逐个row插入。
+
+When using DIRECT, then the results from the query are directly applied in the target table without any intermediate step.
+-Insert.insertFromSelect=true
+把select的结果row直接作为insert的输入，直接插入。
+
+When using SORTED, b-tree pages are split at the insertion point. This can improve performance and reduce disk usage.
+-Insert.sortedInsertMode=true
+PageDataLeaf插入row溢出的时候，则以insert point作为split point。
+
+
+Insert总结：
+1、锁。
+有4个lock mode。默认为LOCK_MODE_READ_COMMITTED
+LOCK_MODE_OFF(0)，            READ_UNCOMMITTED，不上锁
+LOCK_MODE_TABLE(1)，          SERIALIZABLE，    表锁
+LOCK_MODE_TABLE_GC(2)，       SERIALIZABLE+GC， 表锁+GC，等待锁的时候会进行GC
+LOCK_MODE_READ_COMMITTED(3)， READ_COMMITTED，  表锁，read lock在命令执行完后马上释放
+
+insert前调用RegularTable.lock()，每个RegularTable都包含lockShared（HashSet<Session>），lockExclusive（Session）对象表示获取共享锁，互斥锁的Session对象。同时Session通过locks记录获取锁的RegularTable。上锁时，按照共享和互斥锁锁兼容性判断，另外注意的是，在LOCK_MODE_READ_COMMITTED下，如果是单线程则不用获取share lock。如果无法获得锁，则进行sleep，同时检测超时、检测死锁，GC等操作。
+
+死锁检测是一个DFS的算法，每次只允许一个session进行检测，具体为，将当前Session，A等待的RegularTable的lockShared，lockExclusive（即获得此表锁的Session）进行遍历，获取这些Session正在等待的表锁，然后递归遍历这些表锁的Session，如果遍历过程中，发现A，则表示死锁。另外注意为了避免堆栈溢出的死循环，要保存每次已经访问过的session，避免重复访问。
+
+2、b-tree page的修改。
+
+3、undo日志。（用于recover）
+<<数据库系统实现>>提到undo日志实现如下：
+..添加undo日志为修改前数据
+..修改记录的内存数据
+..刷新undo日志到硬盘
+..刷新记录的内存数据到硬盘
+..添加commit日志(commit开始)
+..刷新undo日志到硬盘
+
+问题：每次commit就执行flush会造成大量的IO，并且由于硬盘的转速限制，写入量过大则会限制写入速度。另外，市面上的硬盘都会有自己的buffer，flush并不会真正写入到介质上，断电后一样会丢失（除非是不间断电源UPS）。
+
+H2的默认实现采用了commit事务延迟写（大部分数据库都支持的特性），具体如下：
+添加undo日志PageStore.logUndo()，修改记录的内存数据PageStore.update()，添加commit日志PageStore.commit()。
+...记录刷新：
+每次PageStore.commit()的时候，都会检查undo日志大小，超过一定大小（默认阀值DEFAULT_MAX_LOG_SIZE，16MB）则调用PageStore.checkpoint()，删除多余日志，同时会调用PageStore.writeBack()，把记录在内存中的修改刷新到硬盘上。
+...undo日志刷新：
+WriteThread定时刷新undo日志，默认500ms刷新一次。另外可以设置WRITE_DELAY（commit和flush之间最大延迟，实际上是WriteThread的延迟间隔）使每次commit执行flush。
+
+总结：commit延迟写机制可以减轻IO，提高性能，但提高了丢失数据的风险。
+
+4、Session的UndoLog（用于rollback）
+Session.log()
+RegularTable插入row后，往Session添加undo日志，记录的是插入的row（PageLog是插入前添加undo日志，记录的是修改前的page），如果undo日志条数过多，则会写入临时文件。
+commit，直接把之前插入的undo日志删除。
+rollback，从最后开始，倒序遍历undo日志（如果日志保存在临时文件，则批量导入部分undo日志到内存），然后根据日志记录的操作执行反操作（如Inser则delete，delete则insert），然后删除多余的undo日志。由于修改了记录，因此最后还需要执行PageLog.commit添加PageLog的undo日志。
+
+
+字节流写入
+------
+写入byte数组流（目前只有PageLog，undo日志使用），要利用PageOutputStream写入，类型包括TYPE_STREAM_TRUNK和TYPE_STREAM_DATA
+
+*Page页面结构
+TYPE_STREAM_TRUNK   （包含TYPE_STREAM_DATA的id，可以包含(pageSize - DATA_START) / 4个TYPE_STREAM_DATA，以及下一个TYPE_STREAM_TRUNK的id）
+TYPE_STREAM_DATA    （包含数据流的数据，最高可容纳pageSize - DATA_START个字节）
+TYPE_STREAM_DATA
+TYPE_STREAM_DATA
+......
+TYPE_STREAM_TRUNK
+TYPE_STREAM_DATA
+TYPE_STREAM_DATA
+
+*PageOutputStream
+  PageStreamData data;      内存byte数组Data的封装。
+  IntArray reservedPages;   预留页的id数组
+  PageStreamTrunk trunk;    负责保留管理多个pageIDs的数据
+
+*write()方法负责把数据写入到文件。
+写入前进行预留操作，具体是调用reserve()，根据写入数据大小预留一定的page页面（预留策略见下）。接着开始往data page写数据，data page会分配好一个页面大小的buffer，然后往buffer写数据（页面头已经写入）。如果数据太大超出data page的buffer，则把当前data page写入磁盘，然后从PageStreamTrunk中分配新的data page（一般已经预留足够），继续进行写入操作。如果trunk page可以保存的data page也写完，则会从之前预留的页面里拿出一页作为新的trunk page，再开始分配data page。这里注意到，由于每次写之前都进行好预留操作，因此不用担心预留页面不足，需要向PageStore重新分配影响写性能。
+
+*reserve()预留操作。以trunk page能够保存的页面为单位进行分配。
+首先计算trunk Page可以保存多少页面（页面字节大小为2048 - 页面头，则能分配507个），然后计算这些页面总共可以保存多少字节（2048-页面头），如果总共保存字节大于预留字节（这里为1字节），则请求PageStore分配这些页面＋1个trunk page（作为下一个trunk page，总共508页）；初始化trunk page对象PageStremTrunk以及data page对象PageStreamData。初始化trunk page的页面头，并且写入磁盘。
+
+
+PageLog机制
+------
+PageStore成员变量。
+PageLog属于undo log机制，需要不断地写入日志数据，利用PageOutputStream完成底层写入操作。另外如下类型页面都需要添加undo log：
+TYPE_DATA_LEAF = 1;      //A data leaf page (without overflow: + FLAG_LAST)
+TYPE_DATA_NODE = 2;      //A data node page (never has overflow pages).
+TYPE_DATA_OVERFLOW = 3;  //A data overflow page (the last page: + FLAG_LAST).
+TYPE_BTREE_LEAF = 4;     //A b-tree leaf page (without overflow: + FLAG_LAST).
+TYPE_BTREE_NODE = 5;     //A b-tree node page (never has overflow pages).
+TYPE_FREE_LIST = 6;      //A page containing a list of free pages (the last page: + FLAG_LAST).
+
+
+*初始化
+PageLog的初始化过程在Database的初始化中。PageLog的初始化步骤包括读初始化openForReading和写初始化openForWriting，读初始化只是记录第一个trunk page和data page，写初始化需要涉及trunk page和data page的分配。
+
+写初始化PageLog.openForWriting：
+-PageStore分配一个页面作为logFirstTrunkPage，也就是PageLog的第一个trunk page；
+-初始化输出流PageOutputStream。new PageOutputStream(...)
+-输出流预留1字节。产生data page以及下一个trunk page的分配。
+-PageStore.setLogFirstPage。PageStore把第一个trunk page，logFirstTrunkPage以及第一个data page，logFirstDataPage记录记录在页面头中，然后写入磁盘
+-初始化writeBuffer。初始化PageLog自身的writeBuffer。
+
+*添加undo log
+对于每个添加undo log的页面，在checkpoint之间只写入一次。
+-PageStore.logUndo()。入口函数在PageStore.logUndo()。利用bit数组判断对应的页面是否已经刷新到硬盘上，如果没有刷新，则把PageStore转换为写模式（初始化的时候为读模式，PageStore.openForWriting()，一般情况下，初始化转换为写模式，此后不需要转化。）
+
+PageStore.openForWriting()转换写模式。
+-首先PageLog.free()释放PageLog分配的页面。然后重新分配新的页面作为日志的第一个trunk page，logFirstTrunkPage。
+-调用PageLog.openForWriting重新初始化PageLog。
+-调用checkpoint()。具体见下
+
+*CheckPoint
+入口在PageStore.checkpoint()：首先database.checkPowerOff()，然后把PageStore保存的索引逐个写入rowCount大小（刚初始化的时候，只有PAGE_INDEX表的索引）；
+..调用PageLog.checkpoint()，首先在PageOutputStream写入1字节大小的check point标记，然后把已写入undo页面BitField标记清空（表明所有页面可以再次开始写入undo日志），logSectionId加一（把undo日志按照每个check point进行分割，两个check point之间的位置以logSectionId标记），flush掉PageOutputStream（把当前的data page写入硬盘）。重新预留并分配新的data page。把新的logSectionId和新的data page的id保存到logSectionPageMap中。
+..writeBack()回写。把PageStore的内存cache中已经修改过的页面写回硬盘。
+..清理多余的undo日志。首先获取连接到数据库的所有session中第一个没有被提交的事务的sectionID（对应undo日志上的logSectionId），然后PageLog.removeUntil()进行删除操作：具体是首先从logSectionPageMap获取对应的sectionID对应的data page, firstDataPageToKeep，然后从firstTrunkPage的trunk page开始一直删除到包含该firstDataPageToKeep的trunk page为止，具体是往undo日志写入要释放的pages的id，然后从PageStore的缓存中去掉这些页面，同时添加到PageStore的freeList。最后返回剩下的第一个trunk page作为firstTrunkPage。PageStore重新设置firstTrunkPage, firstDataPageToKeep为当前的trunk page和data page。清空logSectionPageMap中多余的logSectionID。（undo日志、freeList page都可能被修改）
+before: trunk1, data1, data2... trunk2, data21, data22, ... trunk3, data31, data32, data_firstDataPageToKeep
+after:  trunk3, data31, data32, data_firstDataPageToKeep
+..再次writeBack()。把freeList在之前的修改刷新到硬盘中。
+..再次PageLog.checkpoint()。确保undo日志写入硬盘。
+..清空硬盘空闲页数据。从PAGE_ID_FREE_LIST_ROOT（值为3）开始到PageStore的所有页，逐个通过FreeList判断查看是否在中使用，如果已经使用freed标记置为false；如果没有使用，则往该页写入0，freed置为true。
+
 
 //delete
 ======================================
@@ -635,11 +890,30 @@ FOR UPDATE
 ======================================
 
 
+
+
+//update
+======================================
+=============== update ===============
+======================================
+
+
+//recover
+======================================
+============== recover ===============
+======================================
+//add, remove, undo, COMMIT, PREPARE_COMMIT, ROLLBACK...
+
+compact?
+
+
 TODO:
 
 Select
 //order by --  TimSort!!  http://svn.python.org/projects/python/trunk/Objects/listsort.txt
-//MVCC ? 
+
+FOR UPDATE
+
 
 
 //TCP server
@@ -648,6 +922,21 @@ Select
 //FOREIGN KEY
 
 //MVStore engine
+
+//MVCC ?  database.isMultiVersion()
+//MULTI_THREADED
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
