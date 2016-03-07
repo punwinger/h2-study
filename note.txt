@@ -8,36 +8,58 @@
 
 Database相关：
 *每个DataBase对象有一个PageStore对象表示Database文件的页集合。
-
 *创建PageStore的时候，会从文件的Page 4读取meta table的root page数据(其中包括所有表的索引的indexId和对应的rootPageId)
 *然后创建Public.SYS. Public.SYS保存创建其它元数据表的SQL语句
+*schemas保存两个Schema对象，PUBLIC和INFORMATION_SCHEMA。PUBLIC是用户表的Schema，其中有表PUBLIC.SYS专门保存所有表的CREATE SQL语句。INFORMATION_SCHEMA是LOB存储，SESSION，USER，RIGHTS等的Schema。Schema对象中，tablesAndViews负责保存tableName和Table对象的映射，执行Select,insert,delete等operations的时候就从映射获取Table对象。
 
-*PageStore读取一个指定pageId的Page时候，根据pageId << pageSizeShift计算Page的偏移，然后读取pageSize大小（默认2048）到byte数组中。即文件按照固定pageSize大小分每个Page。
-
-*RegularTable对象表示数据库中的表。
-*RegularTable初始化的时候，如果是持久化则创建PageDataIndex作为mainIndex和scanIndex，否则创建ScanIndex对象作为scanIndex，mainIndex为null。
-*RegularTable的primary key是单一列，并且类型是long,int,short,byte的时候，会创建封装mainIndex的PageDelegateIndex作为primary key的索引，否则会创建PageBtreeIndex作为primary key的索引。
 
 DataBase
 |
+|--schemas
+|--mainSchema(PUBLIC)
+|--infoSchema(INFORMATION_SCHEMA)
 |--RegularTable meta(Public.SYS)
 |--PageStore
    |
    |--CacheLRU
    |--FileStore
 
+Database初始化：
+Database.open()
+1.先完成数据库文件的初始化
+2.然后是PageStore/MVStore存储引擎的初始化（Database.getPageStore()，包含MVStore初始化，名字不好。）
+3.Background flush thread的初始化
+4.Schema的初始化。Schema包括PUBLIC和INFORMATION_SCHEMA。
+  1)首先新建是PUBLIC和INFORMATION_SCHEMA的Schema对象，
+  2)然后创建PUBLIC.SYS表，默认的objectID为0，让存储引擎Store映射对应的表数据。
+  PageStore和MVStore存储引擎都有各自的meta数据保存机制。
+  PageStore在rootPageID为4的位置存放meta数据（PAGE_INDEX表，负责记录表的所有primary和二级索引，包括对应的id和rootPageID，以及索引列等），在Database的初始化前的recover阶段完成ObjectID和rootPageID的映射初始化，包括0映射对应的rootPageID。
+  MVStore在readFileHeader()读取lastChunk.metaRootPos作为meta表的rootPos。table.0到对应的map结构获取PUBLIC.SYS数据。
+
+  3)Public.SYS表初始化的时候，通过保存的SQL语句，创建对应的TableEngine，由它创建对应的Table对象，如果没有TableEngine则默认创建RegularTable。保存创建的Table对象到对应的Schma对象中。
+  4)INFORMATION_SCHEMA的Schema采用延迟初始化，当第一次读取该Schema对象才开始创建表，创建的都是MetaTable，保存的都是和Database相关的一些meta数据，包括SESSION，USER，RIGHTS等。
+
+
 
 PageStore相关：
 *PageStore是整个Database的存储层抽象；包含FileStore对象，封装随机访问文件的功能，包含CacheLRU对象，利用LRU算法缓存Page数据
 *PageStore同时负责通过PageId读取底层文件中不同类型的Page（如PageDataLeaf,PageDataNode, PageBtreeLeaf, PageBtreeNode等）。
-*PageStore也负责本Database的undo log的操控。
+*PageStore也负责本Database的undo/redo日志的操控。
 *FileStore对象可以根据实际情况修改底层访问，如FileDisk、FileMem等
 
--初始化的时候，从Page0读取固定文件头，初始化pageSize、freeListPagesPerList、fileLength、pageCount；接着需要读变量文件头readVariableHeader，首先校验Page1的checksum，如果校验失败，则尝试读Page2，如果都失败则文件损坏。从可变文件头读取，logKey、logFirstTrunkPage、logFirstDataPage等undo日志相关的值。然后初始化PageLog。Page0，Page1，Page2都不会被cache。
+*PageStore读取一个指定pageId的Page时候，根据pageId << pageSizeShift计算Page的偏移，然后读取pageSize大小（默认2048）到byte数组中。即文件按照固定pageSize大小分每个Page。
+
+-初始化的时候，从Page0读取固定文件头，初始化pageSize、freeListPagesPerList、fileLength、pageCount；接着需要读变量文件头readVariableHeader，首先校验Page1的checksum，如果校验失败，则尝试读Page2，如果都失败则文件损坏。从可变文件头读取，logKey、logFirstTrunkPage、logFirstDataPage等undo/redo日志相关的值。然后初始化PageLog。Page0，Page1，Page2都不会被cache。
 
 -PageFreeList。
 使用1 bit表示页是否在使用。pageSize为2048的时候，一个PageFreeList就可以表示2045 * 8 = 16360页，总共可以表示约32MB的数据，当pageID超过16360 + 3的时候，则会重新分配PageFreeList，负责表示后面的16360页是否使用。内部用used的BitField代表已经使用的页，注意从Page4开始计算used的值。
+除了undo/redo日志是数据流，读和写使用顺序IO提升性能，
 PageStore包括一个PageFreeList数组。
+PageStore分配页面需要依靠PageFreeList实现，维护的PageFreeList数组分别管理大量的页面，分配页面的时候，从头遍历PageFreeList数组，找到可以进行分配PageFreeList，进行分配。
+
+-compact
+关闭数据库的时候会进行compact操作，进行碎片整理，清理空页。TODO。
+
 
 Page类型：
 TYPE_EMPTY = 0;          //An empty page.
@@ -68,10 +90,20 @@ PAGE_ID_FREE_LIST_ROOT
 freeList的root。
 
 Page4:
-元数据表metaTable（PAGE_INDEX表）的数据页。
-负责内部表初始化。
+元数据表metaTable（PAGE_INDEX表）的root page。
+负责记录所有表的元数据。
 
-Page5 -- logFirstTrunkPage（1067？） 中都为数据页或者索引页
+
+Table相关：
+PageStore对应RegularTable，MVStore对应MVTable。
+
+RegularTable相关：
+RegularTable属于默认PageStore对应的Table对象。（MVStore对应MVTable）
+*RegularTable对象表示数据库中的表。
+*RegularTable初始化的时候，如果是持久化则创建PageDataIndex作为mainIndex和scanIndex，否则创建ScanIndex对象作为scanIndex，mainIndex为null。
+*RegularTable的primary key是单一列，并且类型是long,int,short,byte的时候，会创建封装mainIndex的PageDelegateIndex作为primary key的索引，否则会创建PageBtreeIndex作为primary key的索引。
+
+
 
 
 (以下开始索引的讨论，暂时忽略用于地理坐标的spatial类型的index)
@@ -138,14 +170,14 @@ data (key: varLong, value,...)
 *内部成员rootPageId所指示索引页，如果数据量少，则指定一个XLeaf，数据量大，rootPageId则指定XNode。
 *结构都是由多层XNode内部结点到最后XLeaf叶子结点的树。
 *PageDataNode保存keys和对应的childPageIds；PageDataLeaf保存keys和对应的offsets，以及data保存row的全部列值。PageDataNode中keys[0]是childPageIds[0]中最大的rowKey，并且keys大小为entryCount，childPageIds大小为entryCount+1，最后一个childPageIds为最右边的子页。
-*PageBtreeNode保存keys（SearchRow）和对应的childPageIDs；PageBtreeLeaf根据情况可能保存row的key或者row的全部值。
+*PageBtreeNode保存keys（SearchRow）和对应的childPageIDs；PageBtreeLeaf根据情况可能保存row的key或者row的全部值。PageBtreeNode中keys[0]同样也是childPageIds[0]中最大的rowKey。
 
 
 ====  PageDataIndex/PageDataNode/PageDataLeaf ====
 *PageDataIndex主要作用就是组织表数据，RegularTable默认创建的mainIndex，只可以用于mainIndex。
 
 *primary key符合条件（单列，并且类型是long,int,short,byte）时，primary key的Index类就简单封装PageDataIndex，同时PageDataNode/PageDataLeaf保存的keys就是primary key的值，否则parimary key的Index类就是PageBtreeIndex类，PageDataNode/Leaf保存的keys数组是对应每个row的自增值。
-
+*如果表中有数据，添加/删除列会令primary key的Index类变为PageBtreeIndex类。（这是由于改变列先复制表，把原来的数据插入表中，然后删除原来的表，初始化新表的时候，会检查mainIndex是否有数据，如果有则不能使用原来的primary key索引。）
 *PageDataNode保存Keys和对应的childPageIds表示子页PageDataLeaf/PageDataNode的pageId，查找key时，通过二分查找找到对应的子页的pageId。然后通过PageStore获取对应的子页
 *PageDataLeaf内部保存Key和对应的offset。keys数组表示保存的key，offsets数组表示成员变量data里面每个key对应的数据offset。data保存的数据是row的全部列的值。
 
@@ -177,19 +209,24 @@ Parser.parse(String sql)
 5.解析结果Command放入cache中
 
 
-//select
-======================================
-=============== Select ===============
-======================================
+
+=======================================================================================================================
+***********************************************************************************************************************
+
+
+                                                     Select
+
+
+***********************************************************************************************************************
+=======================================================================================================================
+
 *Select命令执行的时候，每个表用TableFilter表示，每个TableFilter只能有一个index。
-*TableFilter有IndexCursor cursor对象，方便利用PageIndex对象进行迭代查询
+*TableFilter有IndexCursor cursor对象，方便利用PageIndex对象进行迭代查询。通常情况下，查找都会预先指定一段范围[first, last]，然后利用二分查找到刚小于或等于first的元素，接着由Cursor进行next/previous的逐个元素遍历，直到超出指定范围为止。
 
-*Select.preparePlan() -> Optimizer.optimize() -> Optimizer.calculateBestPlan() 如果只有一个表，则采用计算这个表的cost选择select索引。少于等于7个表的时候，采用BruteForce算法（应该是对所有排列可能性计算cost）
+*Select.preparePlan() -> Optimizer.optimize() -> Optimizer.calculateBestPlan() 如果只有一个表，则采用计算这个表的cost选择select索引。少于等于7个表的时候，采用BruteForce算法（对所有排列可能性计算cost）
 *计算表的cost的时候，如果没有可用索引的条件语句，则使用RegularTable的scanIndex作为此次查询的索引。否则遍历所有索引，调用Index.getCost，通过where中条件列的情况，以及sortOrder计算cost，并选择出cost最低的索引，因此每次一个table只能一个索引。
-对于B-树范围索引，计算cost的方法是BaseIndex.getCostRangeIndex()。具体cost计算方法建议查看代码。需要考虑多列索引的情况下，每一列指定相等、范围、半范围条件的情况，另外还要考虑符合order by的情况下，可以减轻cost。
+对于PageBtreeIndex和PageDelegateIndex，计算cost的方法是BaseIndex.getCostRangeIndex()。具体cost计算方法建议查看代码。需要考虑多列索引的情况下，每一列指定相等、范围、半范围条件的情况（前缀索引），还要考虑符合order by的情况下，可以减轻cost。
 
-
-TableFilter -> IndexCursor(支持IN(..)以及IN(SELECT ...)优化) -> PageDataCursor/PageBtreeCursor
 
 *IndexCursor in优化？
 *PageDataCursor的成员变量maxKey在每次迭代的时候判断是否超出范围，成员变量idx表示当前的row索引
@@ -217,8 +254,40 @@ TableFilter -> IndexCursor(支持IN(..)以及IN(SELECT ...)优化) -> PageDataCu
 
     二分查找成功后，cursor = PageDataCursor
 
-  2.IndexCurosr.next()
-    PageDataCursor.next()
+
+
+IndexCursor.next()
+-----
+对于PageStore只有一层
+PageDataCursor/PageBtreeCursor.next()
+超出max范围就停止遍历，返回false。
+
+对于MVStore，则有三层，见下面详细解释。
+
+
+Select的缓存lastResult：
+------
+主要用途，当多次执行Select命令时，如果table数据没有被修改，可以不用执行Select，直接返回shallow copy后的lastResult。
+
+1.首先是如何确定客户端发送的是否已经被执行过的命令？ 
+客户端向服务器执行select需要4个来回协议：SESSION_PREPARE_READ_PARAMS，COMMAND_EXECUTE_QUERY，RESULT_CLOSE，COMMAND_CLOSE
+(insert, delete, update由于不需要缓存结果集，只需要2个协议, SESSION_PREPARE_READ_PARAMS准备协议以及COMMAND_EXECUTE_UPDATE执行协议)
+
+*执行SESSION_PREPARE_READ_PARAMS协议时，命令经过解析后，Session会缓存对应sql字符串以及解析后的命令对象Command。Session.prepareLocal()。因此如果客户端执行一摸一样的SQL查询时，就可以免去解析过程，直接将command对象作为解析结果。然后TCP线程缓存起来，等待下一个协议响应。
+*执行COMMAND_EXECUTE_QUERY协议时，把该命令对象取出，假设是Select命令，所以事实上是Select对象。因此就可以确定同一个Select对象对于同一个SQL命令多次执行。
+*RESULT_CLOSE协议，COMMAND_CLOSE协议：两个协议分别释放之前的结果集对象的缓存以及Select对象在TCP线程中的缓存。Session对于Select对象的缓存（LRU），以及Select对象自身内部的lastResult缓存没有被释放。
+
+另外，sql对象字符串只要有少许不同，例如多了空格，Session缓存就会失效，会重新解析一个新的Select对象。
+
+2.然后如何判断table数据是否被修改：
+主要由Database的数据修改ID，modificationDataId以及其下所有表(RegularTable或MVTable)都各自维护的修改ID，lastModificationId。
+
+简单来说，就是当表执行addRow, removeRow, truncate, commit四个修改table数据的方法就会调用database.getNextModificationDataId(); 使database的modificationDataId加1，然后该表就保存该值到lastModificationId。事实上只有database的全局modificationDataId进行计数，所有的表都是记录该值作为checkpoint。
+*getMaxDataModificationId()接口返回上一个data修改的ID。
+
+这样Select对象通过判断要查询所有表的最大lastModificationId即可知道表是否经过修改。具体是第一次执行时，保存当前的database的modificationDataId到自身的lastEvaluated，然后等下次再执行的时候，如果database的modificationDataId大于lastEvaluated，并且所有表中最大的lastModificationId大于lastEvaluated，那就是某个表的数据经过修改，lastResult无效。
+事实上，Select第一次执行可以直接保存所有表最大的lastModificationId到lastEvaluated，然后第二次执行，直接对比所有表最大的lastModificationId是否大于lastEvaluated也可。
+PS：貌似这里对于multi-thread特性支持不大好。
 
 
 =====  Select.queryFlat ===== 
@@ -229,8 +298,7 @@ Select.queryFlat(TableFilter) -> IndexCursor(支持IN(..)以及IN(SELECT ...)优
 
 *该过程中，直接拿RegularTable的scanIndex进行迭代，key的最小值和最大值为Long.MIN_VALUE和Long.MAX_VALUE，然后不断遍历叶子结点遍历数据。要注意的是叶子结点PageBtreeLeaf/PageDataLeaf的遍历过程: 两个兄弟叶子结点之间并没有指针连接起来，遍历完这个叶子结点要通过递归查询父结点获取下一个兄弟结点。具体为PageDataLeaf.getNextPage / PageBtreeLeaf.nextPage
 
-
-*select索引过程中，首先从索引条件中解析出索引的最小值(>= LONG_MIN)和最大值(<= LONG_MAX)，然后去寻找所属范围最可能包含最小key的PageDataLeaf，寻找成功后PageDataLeaf构造一个PageDataCursor返回。然后TableFilter就开始进行cursor的迭代操作。超出范围则会退出迭代。
+*select索引过程中，首先从索引条件中解析出索引的最小值(>= LONG_MIN)和最大值(<= LONG_MAX)，然后去寻找所属范围最可能包含最小key的PageDataLeaf，寻找成功后PageDataLeaf构造一个PageDataCursor返回。然后TableFilter就开始进行cursor的遍历操作。
 
 
 Condidtion总体：
@@ -275,11 +343,13 @@ select id1 from test_btree t where v2 in (select v2 from test2 where id >= 30) n
 select id1 from test_btree t where id1 in (select v2 from test2 where id >= 30) index
 
 子select与父select非相关，要分两种情况（no index和index）：
----如果in表达式的左侧列不能使用索引，则会先逐个查询外层table的行，然后在select的condition过滤中，进行子select查询获取总的结果集（只查询一次，结果集会cache到子Select.lastResult），然后在这个结果集中进行查找，有两个方式 1，对于非all的并且是in/=的相等比较时，使用hash的distinct比较(LocalResult.containsDistinct）使用hash而而不用排序＋binary search可以减少value值的实际比较；2、否则遍历结果集逐个比较判断，要注意考虑是否all，最后返回condtion过滤结果。
+---如果in表达式的左侧列不能使用索引，则会进行全范围scan。在查询外层table的行的时候，condition过滤中，进行子select查询获取总的结果集（只查询一次，结果集会cache到子Select.lastResult），然后在这个结果集中进行查找，有两个方式 1，对于非all的并且是in/=的相等比较时，使用hash的distinct比较(LocalResult.containsDistinct）使用hash而而不用排序＋binary search可以减少value值的实际比较；2、否则遍历结果集逐个比较判断，要注意考虑是否all，最后返回condtion过滤结果。
 ---如果in表达式的左侧列可以使用索引，则左侧列对应的TableFilter会创建indexConditions，这样在计算cost的时候，由于子select是evauable，所以可以创建对应索引。执行时进行子select递归查询，获取结果集，缓存到内存中，再逐个对这些值进行父select的索引查询。
 （对于非相关性，实现就是和缓存小表进行join一样，但是如果in的子select结果集大，则会消耗大量内存。改良方法：可以考虑转化为子select去重后进行nested loop join。如果转化为join之后，则通过改变join顺序可能会提高效率）
 
-子select与父select相关，则不能建立索引，这时会首先逐个查询父select的行，然后再传给子select进行查询（可以根据这个值进行索引查询），看看是否满足in的值相等条件。如select * from test_btree t where id1 in (select v2 from test2 where id = t.id)，则会先逐个查询test_btree的值，然后传入t.id到子select，子select会利用id的索引进行查询，如果存在row，则查看v2是否等于id1，如果等于则添加到结果集。
+
+select * from test_btree t where id1 in (select v2 from test2 where id = t.id)
+子select与父select相关，则不能建立索引，这时会首先逐个查询父select的行，然后再传给子select进行查询（可以根据这个值进行索引查询），看看是否满足in的值相等条件。如例子中，会先逐个查询test_btree的值，然后传入t.id到子select，子select会利用id的索引进行查询，如果存在row，则查看v2是否等于id1，如果等于则添加到结果集。
 以上查询执行效果与join类似：select * from test_btree a join test2 b on (a.id = b.id and a.id1 = b.v2)。但以上的子查询等于限制了join顺序，不能进行优化。
 
 关于join和子查询的比较
@@ -332,8 +402,8 @@ HISTOGRAM             HISTOGRAM(expression)     （柱状图）
 只能COUNT_ALL，COUNT，MIN，MAX的聚集类型。对于COUNT、COUNT_ALL直接获取表的行数即可。对于MIN、MAX根据情况利用索引获取第一个或最后一个的值。
 检查的条件比较严格：
 没有group by，having语句，且只查找一个表
-expressions：类型为COUNT时，里面的表达式不能为distinct且不能为NULL，最后还需要表能直接获取行数。类型为COUNT_ALL只需要表能直接获取行数。类型为MIN、MAX的要存在以该列为第一索引列的索引，如以索引(a,b)，则MIN(a)为true，MAX(b)为false。
-condition：存在有列表达式就为false。
+expressions：类型为COUNT时，里面的表达式不能为distinct且不能为NULL，最后还需要表能直接获取行数。类型为COUNT_ALL只需要表能直接获取行数。类型为MIN、MAX的要存在以该列为第一索引列的索引，也就是满足索引前缀，如以索引(a,b)，则MIN(a)成立，MAX(b)为不成立。
+condition：存在有列表达式就不成立。
 
 ------
 select sum(id), avg(v1) from test2 group by v3 having sum(v2) > 10;
@@ -350,7 +420,7 @@ having过滤：
 
 *优化的聚集投影（非强制表达式必须出现在group by中）：
 ExpressionColumn.updateAggregate()
-select的表达式以及having表达式中，如果某一列在同一group by分组中的值均相等，则该列可以不需要出现在group by分组。
+select的表达式以及having表达式中，如果某一列在同一group by分组中的值均相等，则该列可以不需要出现在group by分组。query execution时判断。
 
 *Aggreate.updateAggreate() --> AggregateData.add()
 对于COUNT、SUM、MIN、MAX、AVG的处理都很简单，基本在row分到对应分组后进行处理，最后获取结果的时候如有需要继续进行处理。
@@ -443,7 +513,7 @@ select a.id, b.v1 from test a join test2 b on a.id = b.id where a.name >= 'aaa' 
 
 流程：
 1、条件上推（Parser阶段）。Parser.parseJoinTableFilter把非outer join的joinCondition（a.id = b.id）添加到Select.condition中，Parser.parseSelectSimple把where的条件加入到Select.condition中。这样就把所有的condition上推到顶层Select中。
-2、索引条件下推（准备阶段）。Select.prepare中，所有的TableFilter会根据Select的condition判断是否适合创建IndexCondition（Index遍历需要）。
+2、索引条件下推（准备阶段）。Select.prepare中，所有的TableFilter会根据Select的condition判断是否适合创建IndexCondition（Index遍历需要），也就是下推到TableFilter。
 3、cost计算（优化阶段）。Select.preparePlan过程中，首先push所有Select的condition到每个TableFilter的fullCondition中，然后Optimizer.optimize()优化过程计算所有A(n,n)的join组合，这个过程会参考indexCondition进行cost的计算，最后选择最小cost的join组合作为执行plan。
 4、fullCondition下推（优化阶段）。主要把满足条件的fullCondition下推到filterCondition（在嵌套循环中过滤，Plan.optimizeFullCondition）。大致要求condition的表达式必须是evaluatable，也就是如果涉及别的表的列表达式，则该表达式必须是较前join顺序的表。另外对于AND的condition，可以left和right分别判断是否符合条件，但对于OR的condition，必须是左右同时满足evaluatable（可以仔细想想为什么，因为OR的话，如果仅仅left符合，但不确定是否可以filter，所以必须left和right均一起添加到filterCondition才有意义，但AND则可以left或者right符合，则可以判断是否filter）。
 
@@ -467,7 +537,7 @@ select a.id, b.v1 from test a join (select * from test2 where id <= 99) b on (a.
 总体流程和上面的condition push down & filterCondition差不多，关键是内层的Select看成virtual table，table为TableView，视图。
 
 过程：
--外层Select解析为TableFilterA和TableFilterB。TableFilterB（内部的table为TableView，视图。同时包含内层的Select语句），就是把内层Select解析成一个virtual table。（内层Select解析的过程有点麻烦（待深入））
+-外层Select解析为TableFilterA和TableFilterB。TableFilterB（内部的table为TableView，视图。同时包含内层的Select语句），就是把内层Select解析成一个virtual table。（内层Select解析的过程有点麻烦（TODO）
 -条件上推。外层Select的condition为 a.id = b.id and b.v1 <= 99
 -索引条件下推。TableFilterA的IndexCondition为 a.id = b.id。TableFilterB的IndexCondition为 a.id = b.id和v1 <= 99。
 -计算cost。同样是列出所有的排序顺序A(n,n)，然后通过公式cost = costA + costA * costB计算cost。另外还会push顶层的condition到TableFilterA, TableFilterB的fullCondition。
@@ -672,10 +742,17 @@ UNION_ALL添加结果集即可，UNION通过addRows添加left和right结果集�
 Select总结：Select的实现由于仅支持nested loop，扩展性极差，是属于面向过程的实现；对于condition的优化不够好，loop过程中有一些重复的condition。可以参考PostgreSQL的执行流程，让一些诸如scan、sort、join的操作对象化，组成类似树的结构。另外对于condition优化，应该参考Hive的树遍历机制，整理condition。
 尽量不要用right outer join，不要用in子查询（join+distinct替代），
 
-//insert
-======================================
-=============== insert ===============
-======================================
+
+=======================================================================================================================
+***********************************************************************************************************************
+
+
+                                                     Insert
+
+
+***********************************************************************************************************************
+=======================================================================================================================
+
 insert into test4 values(14, 14);
 
 流程：
@@ -698,11 +775,11 @@ unlock所有在Session保存的锁表locks中的锁。
 
 *index.add()实现 (PageDataIndex、PageBtreeIndex)：
 PageDataIndex ：
-把row插入rootPage，然后计算出split point，如有需要则split该rootPage，rootPage有可能是Leaf或Node。注意split rootPage的时候，为了不改变rootPageId带来的负担，更改原来rootPage的pageID，然后再原来的rootPageID上创建新的PageDataNode。split完成后，然后需要重新插入查找插入位置，再进行插入操作。
-然后更新rowCount，然后调用PageStore.logAddOrRemoveRow()，让当前session记录当前logSectionId，logPos作为第一个没提交的事务记录。然后往PageLog写入type为ADD的日志并输出到PageOutputStream。
+把row插入rootPage，然后计算出split point，如有需要则split该rootPage，rootPage有可能是Leaf或Node。插入前决定row的key（如果存在主索引列，则以该列的值作为key，否则以记录的lastKey递增的值作为key），注意split rootPage的时候，为了不改变rootPageId带来的负担，更改原来rootPage的pageID，然后再原来的rootPageID上创建新的PageDataNode。split完成后，然后需要重新插入查找插入位置，再进行插入操作。
+然后更新rowCount，然后调用PageStore.logAddOrRemoveRow()，写入redo日志，让当前session记录当前logSectionId，logPos作为第一个没提交的事务记录。然后往PageLog写入type为ADD的日志并输出到PageOutputStream。
 
 PageBtreeIndex：
-add方法基本一致，但不需要后面的logAddOrRemoveRow（PageDataIndex必定已调用）
+add方法基本一致，但不需要后面的logAddOrRemoveRow（redo日志只需要写一次，PageDataIndex必定已调用）
 
 插入row到PageDataLeaf、PageDataNode、PageBtreeLeaf、PageBtreeNode：
 主要有两个方法addRowTry()、split()。4个页类型都有自己的实现，addRowTry()主要是添加row到该页，并且返回split point。split()则是split page，创建新的兄弟叶子结点。
@@ -788,63 +865,139 @@ insert前调用RegularTable.lock()，每个RegularTable都包含lockShared（Has
 
 2、b-tree page的修改。
 
-3、undo日志。（用于recover）
-<<数据库系统实现>>提到undo日志实现如下：
-..添加undo日志为修改前数据
-..修改记录的内存数据
-..刷新undo日志到硬盘
-..刷新记录的内存数据到硬盘
-..添加commit日志(commit开始)
-..刷新undo日志到硬盘
-
-问题：每次commit就执行flush会造成大量的IO，并且由于硬盘的转速限制，写入量过大则会限制写入速度。另外，市面上的硬盘都会有自己的buffer，flush并不会真正写入到介质上，断电后一样会丢失（除非是不间断电源UPS）。
-
-H2的默认实现采用了commit事务延迟写（大部分数据库都支持的特性），具体如下：
-添加undo日志PageStore.logUndo()，修改记录的内存数据PageStore.update()，添加commit日志PageStore.commit()。
-...记录刷新：
-每次PageStore.commit()的时候，都会检查undo日志大小，超过一定大小（默认阀值DEFAULT_MAX_LOG_SIZE，16MB）则调用PageStore.checkpoint()，删除多余日志，同时会调用PageStore.writeBack()，把记录在内存中的修改刷新到硬盘上。
-...undo日志刷新：
-WriteThread定时刷新undo日志，默认500ms刷新一次。另外可以设置WRITE_DELAY（commit和flush之间最大延迟，实际上是WriteThread的延迟间隔）使每次commit执行flush。
-
-总结：commit延迟写机制可以减轻IO，提高性能，但提高了丢失数据的风险。
+3、undo/redo日志。（用于recover）
 
 4、Session的UndoLog（用于rollback）
 Session.log()
-RegularTable插入row后，往Session添加undo日志，记录的是插入的row（PageLog是插入前添加undo日志，记录的是修改前的page），如果undo日志条数过多，则会写入临时文件。
-commit，直接把之前插入的undo日志删除。
-rollback，从最后开始，倒序遍历undo日志（如果日志保存在临时文件，则批量导入部分undo日志到内存），然后根据日志记录的操作执行反操作（如Inser则delete，delete则insert），然后删除多余的undo日志。由于修改了记录，因此最后还需要执行PageLog.commit添加PageLog的undo日志。
 
 
-字节流写入
+
+=======================================================================================================================
+***********************************************************************************************************************
+
+
+                                                     Delete
+
+
+***********************************************************************************************************************
+=======================================================================================================================
+
+delete from test4 where id > 1000
+
+流程：
+1、Parser解析
+2、Delete.prepare()，condition优化，计算cost最小的plan。
+3、Delete.update()执行命令。
+
+
+Delete.update()
+首先获取test4表的互斥锁，然后查询test4表所有符合condition的rows（如果数据量太大，保存到临时文件。这里把文件按照FILE_BLOCK_SIZE，16字节划分，写入读取大小都按FILE_BLOCK_SIZE整数，批量、对齐的IO操作可以提高效率 https://www.percona.com/blog/2011/06/09/aligning-io-on-a-hard-disk-raid-the-theory/，RAID，文件系统分块等原因）。然后遍历rows，逐个执行RegularTable.removeRow删除，并且记录到Session的undo日志。最后还要注意一些触发器以及限制的判断。
+
+RegularTable.removeRow()
+逻辑上和addRow类似，只不过这里需要倒序遍历index（防止在遍历索引删除过程中出错，则需要重新遍历索引插入该row，如果顺序遍历，则再次插入row的时候，rowKey会改变，这样会影响后续Index的再次插入），执行index.remove()删除row。另外在最后执行analyzeIfRequired()更新统计数据。
+
+index.remove()
 ------
-写入byte数组流（目前只有PageLog，undo日志使用），要利用PageOutputStream写入，类型包括TYPE_STREAM_TRUNK和TYPE_STREAM_DATA
+PageBtreeIndex
+如果只剩下一个row，则清空所有的页面，创建一个空的PageBtreeLeaf更新PageStore。多于一个row时，调用rootPage.remove()，然后rowCount--。
 
-*Page页面结构
-TYPE_STREAM_TRUNK   （包含TYPE_STREAM_DATA的id，可以包含(pageSize - DATA_START) / 4个TYPE_STREAM_DATA，以及下一个TYPE_STREAM_TRUNK的id）
-TYPE_STREAM_DATA    （包含数据流的数据，最高可容纳pageSize - DATA_START个字节）
-TYPE_STREAM_DATA
-TYPE_STREAM_DATA
-......
-TYPE_STREAM_TRUNK
-TYPE_STREAM_DATA
-TYPE_STREAM_DATA
+PageBtreeLeaf.remove()
+二分查找删除的row，PageLog记录undo日志，然后从内存数据data中覆盖该row，然后从offsets、rows数组中删除该元素，调用PageStore.update()更新缓存。如果删除的row是最后的那个row，也就是key最大的，就要返回删除后最大row（如果删除后为empty page，则返回删除的row），让父page修改对应的结点（父page保存的都是leaf page中最大的key）。否则返回null。
 
-*PageOutputStream
-  PageStreamData data;      内存byte数组Data的封装。
-  IntArray reservedPages;   预留页的id数组
-  PageStreamTrunk trunk;    负责保留管理多个pageIDs的数据
+PageBtreeNode.remove()
+同样是一个递归删除。二分查找删除的row的page，PageLog记录undo日志，然后调用该子page.remove()，如果返回null，则证明最大key不需要修改，返回null表示本page也不需要修改。如果返回的row和删除的row一致，证明子page变为空page，这时释放子page，同时删除对应的key，然后同样需要判断删除后是否empty，末尾key是否改变。如果返回的row和删除不一致，则需要修改对应的key为返回的row的key。最后调用PageStore.update()更新缓存。
+问题：没有实现page合并！
 
-*write()方法负责把数据写入到文件。
-写入前进行预留操作，具体是调用reserve()，根据写入数据大小预留一定的page页面（预留策略见下）。接着开始往data page写数据，data page会分配好一个页面大小的buffer，然后往buffer写数据（页面头已经写入）。如果数据太大超出data page的buffer，则把当前data page写入磁盘，然后从PageStreamTrunk中分配新的data page（一般已经预留足够），继续进行写入操作。如果trunk page可以保存的data page也写完，则会从之前预留的页面里拿出一页作为新的trunk page，再开始分配data page。这里注意到，由于每次写之前都进行好预留操作，因此不用担心预留页面不足，需要向PageStore重新分配影响写性能。
+PageDataIndex
+流程基本和PageBtreeIndex一致。除了要注意CLOB等大对象需要往session注册unlink，并且在最后要往PageLog添加remove该row的undo日志。
 
-*reserve()预留操作。以trunk page能够保存的页面为单位进行分配。
-首先计算trunk Page可以保存多少页面（页面字节大小为2048 - 页面头，则能分配507个），然后计算这些页面总共可以保存多少字节（2048-页面头），如果总共保存字节大于预留字节（这里为1字节），则请求PageStore分配这些页面＋1个trunk page（作为下一个trunk page，总共508页）；初始化trunk page对象PageStremTrunk以及data page对象PageStreamData。初始化trunk page的页面头，并且写入磁盘。
+PageDataLeaf.remove()
+流程基本和PageBtreeLeaf一致。同时注意释放Overflow page。
 
 
-PageLog机制
-------
+=======================================================================================================================
+***********************************************************************************************************************
+
+
+                                                     Update
+
+
+***********************************************************************************************************************
+=======================================================================================================================
+
+流程：
+1、Parser解析
+2、Update.prepare()，condition优化，计算cost最小的plan，优化update中set的表达式
+3、Update.update()执行命令。
+
+Update.update()
+采用先delete后insert的做法，实现简单，但效率低。
+
+注意：
+1.注释提示自身参照完整性在多行更新以及条件反转（update is multi-row and 'inversed' the condition）的时候失效？测试不出问题。
+2.考虑实现in-place update。避免所有indexes都要更新
+
+
+=======================================================================================================================
+***********************************************************************************************************************
+
+
+                                                     Recover
+
+
+***********************************************************************************************************************
+=======================================================================================================================
+日志恢复机制。
+
+begin;
+insert into test3 select max(id) + 1, 15, 15 from test3;
+commit;
+
+begin;
+insert into test3 select max(id) + 1, 15, 15 from test3;
+delete from test3 where id >= 15
+
+
+----------------------------------
+PageLog机制(undo/redo日志)
+-----------------------------------
+1.每次对表进行insert、delete、truncate操作时，都会写入undo/redo日志。
+2.undo日志写入的数据是修改前Page的全部data，
+3.redo日志写入的是insert，delete操作的row的相关数据（ADD，REMOVE日志），也就是逻辑日志。第一次写入redo日志的时候，Session会记录当前的logID，也就是checkpoint的位置，commit的时候置回无效值-1。
+4.checkpoint机制，定期删除多余日志记录，避免日志过长导致recover时间过长。
+
+5.DropTable、CreateTable等非事务命令(DDL)，在执行完成后会直接commit
+
+
+理论：
+<<数据库系统实现>>提到undo/redo日志实现如下：
+..添加undo日志为修改前数据，redo日志为修改后的记录
+..修改记录的内存数据
+..刷新undo/redo日志到硬盘
+..刷新记录的内存数据到硬盘/刷新commit日志到硬盘（两个顺序不限）
+
+checkpoint机制：
+记录在checkpoint时刻没有提交的事务ID，写入start记录，将所有缓冲区修改过的page写入硬盘（不要求必须是提交事务写过的page），写入end记录，刷新日志。
+
+问题：每次commit就执行flush会造成大量的IO，并且由于硬盘的转速限制，写入量过大则会限制写入速度。另外，市面上的硬盘都会有自己的buffer，flush并不会真正写入到介质上，断电后一样会丢失（除非是不间断电源UPS）。
+
+实现：
+H2的默认实现采用了commit事务延迟写（大部分数据库都支持的特性），具体如下：
+添加undo日志PageStore.logUndo()，修改记录的内存数据PageStore.update()，添加commit日志PageStore.commit()。
+...记录刷新：
+只在checkpoint的时候刷新到硬盘上。
+...undo日志刷新：
+WriterThread定时刷新undo/redo日志，默认500ms刷新一次。另外可以设置WRITE_DELAY（commit和flush之间最大延迟，实际上是WriterThread的延迟间隔）使每次commit执行flush。
+另外注意，刷新的undo/redo日志使用了synchronized同步，因此会影响正在写入undo/redo日志的事务的执行。
+
+checkpoint机制：
+每次PageStore.commit()的时候，都会检查undo日志大小，超过一定大小（默认阀值DEFAULT_MAX_LOG_SIZE，16MB）则调用PageStore.checkpoint()。主要目的是清除不必要的日志，具体是找出当前所有正在连接的session的当前没有提交事务的最小logID，logID指定某个checkpoint的位置，删除这个checkpoint之前所有的日志即可。要注意必须首先writeback所有修改过的记录的页面到硬盘，才能进行日志删除操作，这样才能确保已经提交的记录持久化。
+
+总结：commit延迟写机制可以减轻IO，提高性能，但提高了丢失数据的风险，事实上undo/redo日志的实现保证在延迟刷新的时间内，最多只有一个page的数据保留在内存中（参见字节流写入
+机制），因此最多只有一个page的undo/redo日志数据丢失。由于使用的是undo/redo日志，因此记录刷新不用强制要求在commit的时候执行，H2规定只在checkpoint的时候执行，批量的page延迟写入能避免插入过程产生大量IO。
+
 PageStore成员变量。
-PageLog属于undo log机制，需要不断地写入日志数据，利用PageOutputStream完成底层写入操作。另外如下类型页面都需要添加undo log：
+PageLog属于undo/redo机制，需要不断地写入日志数据，利用PageOutputStream完成底层写入操作。另外如下类型页面都需要添加undo log：
 TYPE_DATA_LEAF = 1;      //A data leaf page (without overflow: + FLAG_LAST)
 TYPE_DATA_NODE = 2;      //A data node page (never has overflow pages).
 TYPE_DATA_OVERFLOW = 3;  //A data overflow page (the last page: + FLAG_LAST).
@@ -884,59 +1037,955 @@ after:  trunk3, data31, data32, data_firstDataPageToKeep
 ..清空硬盘空闲页数据。从PAGE_ID_FREE_LIST_ROOT（值为3）开始到PageStore的所有页，逐个通过FreeList判断查看是否在中使用，如果已经使用freed标记置为false；如果没有使用，则往该页写入0，freed置为true。
 
 
-//delete
-======================================
-=============== delete ===============
-======================================
+数据库恢复recover
+------
+PageStore.recover()
+初始化数据库的时候调用。数据库突然崩溃，重启的时候，recover需要使其恢复到崩溃前的状态，尽量恢复已提交事务的数据。
+
+流程：
+1. RECOVERY_STAGE_UNDO阶段。
+顺序读取undo/redo日志，对不同类型的日志进行处理：
+UNDO。则把page的data读出，解压后，写入硬盘。注意尽管多个checkpoint阶段中，同一page出现多次，但UNDO中一个page只写一次。
+CHECKPOINT。logId++，记录checkpoint的次数。
+COMMIT。保存当前commit日志的sessionId, logId, pos。sessionId是commit的session的id，pos是当前日志的位移。
+ADD。如果添加的是index root page的记录，则预留该页面，避免后面redo被分配。（TODO）
+REMOVE/TRUNCATE。忽略。
+ROLLBACK。忽略。
+PREPARE_COMMIT。记录sessionId，transaction名字，当前日志的dataPage id。
+1.1 分配之前预留的页面
+2. RECOVERY_STAGE_ALLOCATE阶段。
+读取undo/redo日志，记录这些日志分配的所有页面。
+2.1 重新读取meta数据（包含所有RegularTable以及相关index和index root page），等待redo阶段操作。
+3. RECOVERY_STAGE_REDO阶段。
+与undo阶段类似，顺序读取undo/redo日志，但对不同类型的日志需要进行redo处理：
+UNDO。则把page的data读出后，忽略。
+CHECKPOINT。logId++，记录checkpoint的次数。
+COMMIT。忽略
+ADD。根据UNDO阶段保存commit的记录，判断当前日志的session是否已经提交，如果已提交，则redo一次add操作，否则忽略。
+REMOVE/TRUNCATE。与ADD类似，判断session是否提交，已提交则redo操作，否则忽略。
+ROLLBACK。忽略。
+PREPARE_COMMIT。忽略
+注意redo阶段不会写入undo/redo日志（FreeList除外），但修改的page仍然在缓存中。
+4.清理。
+removeUntil清理多余日志记录，清理临时index，释放UNDO阶段的预留页，writeBack把缓存中修改的页回写到硬盘（包括FreeList页）。清空其它数据结构
+
+
+总结：修改的记录只在checkpoint、或者缓存超过阈值才进行刷新，而且undo/redo日志也使用延迟写机制，这些措施都尽可能减小了IO，提高写入性能。但在初始化database的recover中，undo阶段，不判断是否已提交事务，直接写入所有undo日志的page，产生大量不必要的IO。可以通过checkpoint记录活跃事务，从而判断撤销或者重做的记录
+
+
+字节流写入
+------
+写入byte数组流（目前只有PageLog使用），要利用PageOutputStream写入，类型包括TYPE_STREAM_TRUNK和TYPE_STREAM_DATA
+对于undo日志，recover的时候顺序IO能够提升性能，因此一般分配页面的时候尽可能地分配顺序页面，这可以通过一次过分配多个顺序页面，进行预留操作实现。
+
+
+*Page页面结构
+TYPE_STREAM_TRUNK   （包含TYPE_STREAM_DATA的id，可以包含(pageSize - DATA_START) / 4个TYPE_STREAM_DATA，以及下一个TYPE_STREAM_TRUNK的id）
+TYPE_STREAM_DATA    （包含数据流的数据，最高可容纳pageSize - DATA_START个字节）
+TYPE_STREAM_DATA
+TYPE_STREAM_DATA
+......
+TYPE_STREAM_TRUNK
+TYPE_STREAM_DATA
+TYPE_STREAM_DATA
+
+*PageOutputStream
+  PageStreamData data;      内存byte数组Data的封装。
+  IntArray reservedPages;   预留页的id数组
+  PageStreamTrunk trunk;    负责保留管理多个pageIDs的数据
+
+*write()方法负责把数据写入到文件。
+写入前进行预留操作，具体是调用reserve()，根据写入数据大小预留一定的page页面（预留策略见下）。接着开始往data page写数据，data page会分配好一个页面大小的buffer，然后往buffer写数据（页面头已经写入）。如果数据太大超出data page的buffer，则把当前data page写入磁盘，然后从PageStreamTrunk中分配新的data page（一般已经预留足够），继续进行写入操作。如果trunk page可以保存的data page也写完，则会从之前预留的页面里拿出一页作为新的trunk page，再开始分配data page。这里注意到，由于每次写之前都进行好预留操作，因此不用担心预留页面不足，需要向PageStore重新分配影响写性能。
+
+*reserve()预留操作。以trunk page能够保存的页面为单位进行分配。
+先计算trunk Page可以保存多少页面（页面字节大小为2048 - 页面头，则能分配507个），然后计算这些页面总共可以保存多少字节（2048-页面头），如果总共保存字节大于预留字节（这里为1字节），则请求PageStore分配这些页面＋1个trunk page（作为下一个trunk page，总共508页）；初始化trunk page对象PageStremTrunk以及data page对象PageStreamData。初始化trunk page的页面头，并且写入磁盘。
 
 
 
 
-//update
-======================================
-=============== update ===============
-======================================
+=======================================================================================================================
+***********************************************************************************************************************
 
 
-//recover
-======================================
-============== recover ===============
-======================================
-//add, remove, undo, COMMIT, PREPARE_COMMIT, ROLLBACK...
+                                                    Transaction
 
-compact?
+
+***********************************************************************************************************************
+=======================================================================================================================
+
+MULTI_THREADED
+------
+开发阶段特性。可以让连接的session同时执行statement。默认下同时只能有一个session对同一个database执行statement。
+
+
+Transaction Isolation
+------
+H2只支持三种事务隔离等级：
+Read Committed（默认）。
+  读不需要加锁，但在MULTI_THREADED下会加锁，但在statement结束时释放。写要求一直持有锁，直到事务提交后一次释放所有锁。
+Serializable
+  读和写都要加锁，直到事务提交后一次释放所有锁。
+Read Uncommitted
+  不加任何锁。
+
+问题：
+Dirty Reads。脏读。
+  读取了任何没提交事务的修改。另外脏读还可能导致级联回滚问题。只有Read Uncommitted发生。
+
+Non-Repeatable Reads。非可重复读。
+  同一事务中，多次读取同一row可能读取到不同的已提交事务修改的值。只有Read Uncommitted，Read Committed发生。
+
+Phantom Reads。幻读。
+  同一事务中，用同一condition多次读取table，可能读取到已提交事务新插入的值。只有Read Uncommitted，Read Committed发生。
+
+另外还可能出现覆写问题。
+  也就是事务A首先写入row，事务B接着写入row，此时事务A回滚，这时row会被修改为A写入前的值，也就是事务B的修改丢失。只有Read Uncommitted发生。
+
+
+Table Level Locking
+------
+事务采用二阶段封锁＋表锁实现事务并发控制。避免脏读，覆写等问题。
+实现通过Table记录所有获得共享锁以及互斥锁的session，以及session记录获得表锁的所有Table。
+死锁检测就是DFS算法遍历查找。
+
+UndoLog
+------
+事务的rollback主要依靠Session的UndoLog来实现。Session的UndoLog区别于PageLog的undo/redo日志，由于undo/redo日志为了防止数据丢失，必须定时刷新到硬盘上，因此使用专门的UndoLog可以避免事务rollback时产生不必要的IO。
+
+RegularTable插入／删除row后，往Session添加undo日志，记录的是插入的row（PageLog是插入前添加undo日志，记录的是修改前的page数据），如果undo日志条数过多，则会写入临时文件。
+commit，直接把之前插入的undo日志删除。
+rollback，从最后开始，倒序遍历undo日志（如果日志保存在临时文件，则批量导入部分undo日志到内存），然后根据日志记录的操作执行反操作（如Inser则delete，delete则insert），然后删除多余的undo日志。由于修改了记录，因此最后还需要执行PageLog.commit添加PageLog的undo日志。
+
+
+Two Phase Commit
+------
+PREPARE_COMMIT是2 phase commit的预提交，可用于分布式事务。参考MySQL的xa事务。
+Session进行PREPARE_COMMIT后，如果客户端断开连接，则数据库会rollback该事务。如果是数据库崩溃，则数据库重启后会恢复该事务为IN_DOUBT状态。
+然后执行COMMIT TRANSACTION transactionName或ROLLBACK TRANSACTION transactionName，进行事务提交或rollback。
+
+*The database needs to be closed and re-opened to apply the changes*
+如果数据库崩溃过后恢复，在recover过程发现存在IN_DOUBT事务，则设置database为readonly。此时必须commit或rollback该IN_DOUBT事务。然后重启数据库才能生效。这是因为重新提交往PageLog写入commit日志，recover的时候则会恢复该事务。
+
+问题：
+过程需要强制重启数据库，是否有更好的实现？
+
+
+Multi-Version Concurrency Control (MVCC)
+------
+"MVCC=TRUE;AUTOCOMMIT=OFF"
+database.isMultiVersion() == true
+
+delete, insert and update使用共享的表锁；
+添加或删除列、drop table、select...for update等DDL使用互斥表锁；
+如果未提交事务写入row，其它Session读取的是该row的写入前的值。
+只有提交的数据，才能被其它Session读取。
+多个Session更新同一row，会等待，直到其它Session commit或者超时。
+
+
+理论对比：
+在《数据库系统实现》中，实现的是串行化的MVCC，每个Row都有读时间戳RT，写时间戳WT，是否提交位变量C，另外还会保存未提交事务修改前的旧版本Row。
+根据读写时间戳的大小判断请求是否可行。另外读还会查找旧版本符合的Row。
+
+H2实现的是read commited的MVCC，每个Row都有delete位变量，sessionID记录未提交事务的id，还有version避免相同row插入delta，也有保存未提交事务修改导致的差异delta。
+由于是read committed，没有严格考虑事务先后发生顺序，如两个没提交事务，后来的事务可以写入已经被前面事务读取的数据。要实现可序列化，需要使用时间戳实现MVCC。另外H2的MVCC有bug。
+同时该MVCC对于写冲突的行为更加类似悲观锁模式（）
+
+
+Database初始化MVCC=true时
+recover阶段，MVCC设为false， because the multi-version index sometimes compares rows and the LOB storage is not yet available.
+recover结束后，恢复到原来值。
+RegularTable初始化index的时候，除了scanIndex，其它都被封装到MultiVersionIndex类中(PageBtreeIndex,PageDelegateIndex, etc)。
+
+
+MultiVersionIndex封装了原来的二级索引，并且创建delta作为差异更新，delta的索引列和原来的二级索引一致，因此compareRows的时候只比较对应的索引列，另外compareKeys则会当key相同时，继续比较version，version越大则越小。
+delta是TreeIndex（内存AVL树，AVL树是自平衡二叉搜索树，以发明者命名），add/remove的时候会自动进行balance操作，add会根据LL（右旋转）、RR（左旋转）、LR（下部分左旋转，整个部分右旋转）、RL（下部分右旋转，整个部分左旋转）进行结点旋转。remove的操作类似（但要注意remove的结点有left和right的时候）。H2的实现利用balance因子记录子树平衡情况，然后进行结点替换。
+
+Command.filterConcurrentUpdate()发现更新同一row，等待后重试，超时则抛出异常
+
+
+1.Select
+Select默认不加锁，如果已经存在互斥表锁，则需要等待。
+候选index中包括MultiVersionIndex和PageDataIndex。两个Index分别实现了MVCC读写。MultiVersionIndex负责保证能够只读取事务已提交的数据。
+
+Select的关键是对未提交事务的Insert和Delete（Updae实现为Delete old + Insert new）的处理：
+忽略Insert的，选择Delete前的。忽略Insert的可以靠Row的sessionId属性，对于Delete的，需要记录所有未提交事务Delete的row，也就是Delta。但如果同一事务先insert再delete同一row但仍不提交，只记录delete的row到delta是会导致其它事务会select了该row，因此必须add也同时添加到Delta，然后进行先删除后添加的判断（事实上仍然存有bug）。
+
+PageDataIndex扫描查找：
+PageDataIndex只应用于全表扫描。
+PageDataCursor.next()
+先遍历Iterator delta（PageDataIndex.delta.iterator()）。只Select其他未提交事务修改（sessionId不等于当前SessionId）且被删除的row（isDeleted() == true）。
+然后遍历当前PageDataLeaf里包含的row。只Select出本事务修改的row或者其他事务已经提交的row。
+
+问题：这次的遍历没有遵守key的从小到大？但问题不大，貌似SQL标准没规定。
+
+MultiVersionIndex范围查找[first, last]：
+让base索引和delta索引分别找到刚小于或等于first元素，然后把各自的Cursor组合到MultiVersionCursor进行逐个元素遍历。
+MultiVersionCursor.next()
+-首先通过TreeCursor遍历TreeIndex delta中的数据，指定范围为[first, last)，node为当前cursor位置。
+TreeCursor遍历通过BST的next()（查找直接后继结点）,previous()（直接前继结点）的迭代实现。
+next()首先迭代查找右子树中的最小结点，如果不存在右子树，则迭代查找父结点中非祖先结点右子树的结点。
+previous()首先迭代查找左子树的最大结点，如果不存在左子树，则迭代查找父结点中非祖先结点左子树的结点。
+-然后通过baseCursor遍历base中的数据。
+baseCursor的multiversion为false，select出来的是所有row，包括未被提交事务修过的数据。
+
+根据deltaRow和baseRow进行select，逻辑上保证不select其它未提交事务修过的数据。
+0.首先按需要分别select出deltaRow和baseRow的数据
+1.如果deltaRow为null，则表明当前没有未提交事务修改的row，则可以直接从baseRow找出数据。如果baseRow也为null，则没有符合的结果。
+2.如果deltaRow的sessionId为当前sessionId，则表明为当前事务修改的数据，继续下面判断，如果delete为true，则重新从delta遍历。
+3.如果baseRow为null，但deltaRow的delete为true，并且deltaRow的sessionId为当前sessionId，则最后一个元素被当前session删除，则没有符合结果。但如果deltaRow的sessionId不等，则是其它未提交session删除，select该row，下次从delta遍历
+4.进行比较baseRow和deltaRow，把MultiVersionIndex的base索引进行其索引列部分的比较，如果相等，继续比较key。根据比较结果判断，如果相等，则判断是否被删除，如果被删除且是当前Session的修改，则抛出异常（还残留在base中），如果不是session的删除，就是insert的row，继续判断delta是否当前session的insert，如果是则select当前row，如果是其它session的insert，则忽略，重新遍历一次。
+
+MultiVersionIndex的遍历遵守从小到大的顺序。
+
+
+Insert
+------
+Insert same row？     由于Index中有相同key，抛出DuplicateKeyException异常
+Inserted and delete？ Inserted无法被select
+Inserted and update？ Inserted无法被select
+same transcation？
+
+
+Insert.update()
+获取互斥锁，变为获取共享表锁。为了避免表元数据修改，所以要上锁，写是乐观并发的，所以是共享锁。
+RegularTable.addRow()。直接把插入的row设置当前的SessionId ，表示当前session的修改row。
+遍历该RegularTable的indexes，插入row：
+
+PageDataIndex.add() 递归PageDataNode.addRowTry(), PageDataLeaf.addRowTry()(照常插入)
+row.setDeleted(false);
+初始化HashSet delta，如果delta存在该row（rollback），则删除，否则添加该row。
+sessionRowCount添加sessionID和当前rowCount（计算rowCount用，另外还有rowCountDiff，rowCount两个变量。TODO）
+
+MultiVersionIndex.add() 先调用base.add()，让内部的真正index添加row。如果delta不存在row并且row的sessionId不为0（创建索引的时候为0），则添加，如果存在同一row（rollback删除的row），则delta删除row，如果存在同一key和version的row，则把version＋1（removeIfExists）。
+
+
+添加UndoLog。另外注意如果UndoLog无使用，commit所有index
+
+
+Delete
+------
+Delete same row？    Delete的时候检查isDeleted()为true则抛出并发更新的异常
+Deleted and insert？  没有提示异常？此时insert的事务select出两个相同primary key，deleted的事务不能rollback只能等待insert的事务rollback。BUG!
+Deleted and update？  与Delete same row一样，抛出并发更新异常
+same transcation？
+
+Delete.update()
+获取互斥锁，变为获取共享表锁。
+Select出所有符合条件的row，添加到rowList。由于限制Select出未被提交事务修过的数据，因此不会存在并发更新问题。
+
+
+RegularTable.removeRow()。然后要把插入的row设置当前SessionId，设置前检验是否被删除，或者已经存在的SessionId（rollback添加的row是同一id）但不是当前的SessionId，则是并发更新异常，需要等待重试插入。
+逆序遍历该RegularTable的indexes，删除row：
+
+MultiVersionIndex.remove()。先调用base.remove()，如果delta不存在row（第一次修改row），则添加，如果存在同一row（rollback添加的row），则delta删除row，如果存在同一key和version的row，则把version＋1（removeIfExists）。
+
+PageDataIndex.remove()。递归删除。
+row.setDeleted(true);
+delta如果存在该row，则删除，否则添加该row。
+
+添加UndoLog。
+
+
+Update
+------
+Update same row？    第二次Update的时候由于Select的row是已经被deleted了，再次delete的时候抛出并发更新异常。
+updated and delete？ Select了被delete的row，再delete抛出并发更新异常。
+updated and insert？ Insert same row一样
+same transcation？
+
+Update.update()
+获取互斥锁，变为获取共享表锁。
+Select出所有更新的row，添加到rowList。
+
+Table.updateRows()。把旧row调用removeRow删除，update的新row用addRow插入。
+这里同样是delta的逻辑（存在即删除，不存在即添加）PageDataIndex的delta包含新旧两个row。
+MultiVersionIndex的delta插入新row A时，如果找到和新row的key和version还有对应索引列一致的row B，但不是完全相等，为了区分插入时这两个row，则B的版本设置为A的版本+1。这样在delta添加B需要比较compareKeys的时候，version越大值越小，则B<A。
+
+另外注意row的key是唯一的，因此delta里面A和B这样的key和version还有对应索引列一致的row最多只有两个（delete、insert产生）。
+
+
+Commit
+------
+Session负责遍历UndoLog，让对应的RegularTable的所有索引commit每个修改的row，PageDataIndex.commit()负责删除delta中row的记录，MultiVersionIndex.commit()同样也是删除delta的记录。
+
+
+限制：
+不能和MULTI_THREADED共同使用；
+UndoLog必须保留在内存里；
+不能修改事务隔离等级（LOCK_MODE）
+
+
+
+关闭Database
+------
+DataBaseCloser.run(), Database.close(), checkpoint, writeback, compact...
+
+
+=======================================================================================================================
+***********************************************************************************************************************
+
+
+                                                    MVStore
+
+
+***********************************************************************************************************************
+=======================================================================================================================
+"MV_STORE=TRUE;AUTOCOMMIT=OFF"
+MV_STORE=TRUE的时候，默认设置Database.multiVersion=true
+
+MV_STORE不能和FILE_LOCK=SERIALIZED共用。
+
+
+=====================
+      Features
+=====================
+**Maps
+1.key lookup
+2.fast index lookup
+3.used like database table(key=>primary key, value=>row)/index(key=>index key, value=>primary key)
+
+**Versions
+access the current and old version
+copy on write
+
+**Transactions
+0.read committed
+1.savepoints
+2.2pc
+3.overhead is small
+
+**TransactionStore
+
+**Pluggable Data Types
+Serialization pluggable
+no length limits
+
+**BLOB Support
+
+**Concurrent Operations and Caching
+LIRS cache, against scan?  https://en.wikipedia.org/wiki/LIRS_caching_algorithm
+NOT support concurrent modification
+MVMapConcurrent support concurrent read, write must after first read
+sharding to multiple maps support concurrent write
+
+**Log Structured Storage
+flush in (commit()/ per 1s in background/ more than a number of pages are modified)
+no transaction log/undo log/in-place updates..
+
+**compact
+write only once, B-tree pages are always full for easily compressed.
+
+**Off-Heap and Pluggable Storage  （OffHeapStore）
+**Encrypted Files
+**Metadata Map
+
+设计上MVMap的接口已经考虑好Session的multi-thread并发修改，在需要的地方添加了synchronized关键字
+
+=====================
+      初始化
+=====================
+MVTableEngine.init();  //builder模式，更规范
+
+Database -> MVTableEngine.Store(负责保存映射tableName和MVTable的tableMap，初始化MVStore、TransactionStore的实例)
+
+Database
+--MVTableEngine.Store mvStore
+  --ConcurrentHashMap tableMap
+  --TransactionStore transactionStore
+    --MVStore store
+  --MVStore store
+    --MVMapConcurrent meta
+    --CacheLongKeyLIRS cache
+    --FileStore fileStore
+
+
+
+file format
+-------
+File Header 1
+File Header 2
+Chunk
+-->Page
+-->Page
+-->Page
+Chunk
+-->Page
+-->Page
+-->Page
+Chunk
+-->Page
+-->Page
+-->Page
+
+
+Map:
+
+MVMap<K, V>
+------
+volatile Page root;                         
+volatile long writeVersion;                 version used for writing
+volatile long currentWriteVersion = -1;     version is set during a write operation
+int id;                                     map id init by MVStore.openMap
+long createVersion;                         version is set by MVStore.openMap when creating
+final DataType keyType;
+final DataType valueType;
+ArrayList<Page> oldRoots                    store old root?
+
+
+MVMap内部结构是BST。
+
+init() 
+MVMap的createVersion和writeVersion都初始化为MVStore的当前版本值currentVersion。同时id为MVStore传入。
+
+
+put() {
+    beforeWrite() //checkConcurrentWrite();  currentWriteVersion = writeVersion;
+    // if root.version == writeVersion then copy. sharedFlags to controll whether share values/keys/childrens/counts,
+    // copy()->COW, sharedFlags = SHARED_KEYS | SHARED_VALUES | SHARED_CHILDREN | SHARED_COUNTS
+    copyOnWrite(root, writeVersion);
+    
+    // if root exceed limit, split it 
+    splitRootIfNeeded(p, v);
+
+    // 递归从root开始插入key/value，注意这是从上到下
+    put(p, v, key, value);
+
+    //更新root，另外会根据需要删除oldRoots保存多余版本的root，并且如果是新版本则添加到oldRoots保存
+    newRoot();
+
+    //重置currentWriteVersion为-1
+    afterWrite();
+}
+
+put方法:
+首先检查是否有并发修改（检查并发修改版本是否为-1，然后设置为当前写版本），如果有则抛出异常。
+然后比较root的当前version是否为当前的writeVersion，如果不是则shallow copy新的page作为新root。
+如果root超出大小限制，则split为两个兄弟page，并且新建一个root，作为它们的parent。
+然后从root开始递归向leaf插入value，如果超出大小限制，则split。  put(Page p, long writeVersion, Object key, Object value)
+设置新的root。（removeUnusedOldVersions, etc...）
+设置并发修改版本为-1
+
+
+get(key)方法就是从root开始二分查找BST。
+
+
+MVMapConcurrent
+------
+
+MVRTreeMap
+------
+
+
+MVStore
+-----
+多版本存储引擎。提供MVMap等接口保存数据。
+
+1.元数据
+MVMapConcurrent<String, String> meta           负责记录每个MVMap的元数据。包括id，name，page root的pos，config(name,type还有createVersion，为第一次创建MVMap的时候MVStore.currentVersion的值)
+ConcurrentHashMap<Integer, MVMap<?, ?>> maps   缓存id和对应的MVMap
+
+
+openMap(name, builder)
+根据name获取对应的MVMap，如果不存在，创建新的MVMap，初始化相关的version。
+
+
+
+
+
+
+MVStore.commit() {
+    //persistent store，
+    if (fileStore != null) {
+        // TODO
+        return commitAndSave();
+    }
+
+    //memory store，则增加当前版本，并且把该MVStore保存的MVMap都设置为该版本。
+    long v = ++currentVersion;
+    setWriteVersion(v);
+    return v;
+}
+
+
+
+
+compact()
+
+
+
+
+Page
+------
+Page是MVMap的BST结构对象。可以作为node和leaf结点。
+
+Page
+--MVMap map
+--long version
+--int keyCount
+--Object[] keys
+--Object[] values
+--int childCount          node专用
+--long[] children         node专用，记录Page的pos，MVStore.readPage()
+--Page[] childrenPages    node专用，记录Page对象
+
+Page.binarySearch(Object key)，标准的Binary Search实现，其中返回-(low + 1)表示要插入的位置为low，查找完成后记录本次查找的结果cachedCompare，这样下次开始查找的位置从cachedCompare开始，如果和上次查找一样，则可以马上结束查找。
+
+Page的insert采用递归式从上至下的insert node方式，首先判断插入的结点是否超过限制，是则首先split，然后插入对应的子结点，然后重新从该父结点开始，递归继续insert node。
+缺点：需要多次binary search。。。
+
+
+Page的BST结构和PageBtreeLeaf/PageDataLeaf大致相同。
+Node结点时，keys[i]的值为childrenPages[i]和children[i]所指的childrenPage的最大值，该子结点范围为[keys[i - 1], keys[i])。
+leaf结点之间同样没有链接，要遍历下一个叶子结点，必须递归查询父node结点，获取兄弟叶子结点。
+
+
+
+MVTable
+------
+
+  包含MVPrimaryIndex，MVDelegateIndex，MVSecondaryIndex三种类型的index。MVPrimaryIndex专门用于scan，MVDelegateIndex封装了MVPrimaryIndex，专门用于primary index，MVSecondaryIndex专门用于二级索引。
+  同样是首先初始化MVPrimaryIndex，默认的mainIndexColumn为-1，也就是使用内在的key，然后添加到indexes。接着meta表如果存在用户定义的primary index，则判断如果该index定义符合条件（单列，并且类型是long,int,short,byte，并且是ASC排序），则设置mainIndexColumn为该列。并且此时就会创建MVDelegateIndex添加到indexes，专门用于primary index查询。（MVPrimaryIndex只能用于scan）
+
+MVPrimaryIndex初始化关联MVStore
+//getId()是objectID，创建新表的时候由Database.allocateObjectId()分配。然后保存到meta表中（Database.addMeta()）。database初始化的时候取meta表重新创建表。
+mapName = "table." + getId();
+//dataMap就包含了MVTable的数据。
+dataMap = mvTable.getTransaction(null).openMap(mapName, keyType, valueType);
+
+
+MVPrimaryIndex
+------
+TransactionMap dataMap的map key就是row key。map value存放的都是整个row。
+getCost()和PageDataIndex.getCost()实现一致。10 * (rowCount + Constants.COST_ROW_OFFSET);
+
+
+
+MVDelegateIndex
+------
+和PageDelegateIndex作用类似，作为以primary key为索引进行select的index。简单封装MVPrimaryIndex，getCost(), find()都和PageDelegateIndex的实现一致。
+
+
+MVSecondaryIndex
+------
+TransactionMap dataMap的map key中除了index columns外，还包括row key。这样可以保证key和value唯一对应。因此map key的列数量keyColumns为索引列数量+1。map value存放的都为ValueNull对象的单例。这样在每次构造map key的时候就把row key添加到最后。
+
+getCost的实现和MVDelegateIndex一致。
+
+TODO
+find(Session session, SearchRow first, boolean bigger, SearchRow last)
+bigger = true，没有采用一次二分查找，而是offset * 2后再/2的方法找到刚好大于first的key，然后继续判断当前key是否存在？
+
+
+类比PageBtree.find(SearchRow compare, boolean bigger, boolean add, boolean compareKeys) 通过控制bigger查找刚好少于等于或大于compare的索引。使用一次二分查找即可。
+
+
+
+=====================
+      Select
+=====================
+Select -> TableFilter -> MVTable ->  -> MVPrimaryIndex/MVDelegateIndex/MVSecondaryIndex -> TransactionStore -> MVStore -> CacheLongKeyLIRS/FileStore -> Chunck -> Page
+
+
+所有的MVTable
+MVTable.TransactionStore store = Database.MVTableEngine.Store store.transactionStore 
+
+MVPrimaryIndex.find()
+map = getMap();
+new MVStoreCursor(TransactionMap.entryIterator(min), max);
+
+TransactionMap.entryIterator(min)
+    cursor = MVMap.cursor(from) new Cursor(MVMap, Page root, from) 
+  return new Iterator<Entry<K, V>>() { 
+  {
+    fetchNext(); //初始化，移动cursor到min的前一个值
+  }
+  
+  cursor.next(),cursor.hasNext() 
+  }
+
+
+select xxx from test where xxx
+------
+Select操作符层的逻辑基本没变，关键是MVStore层对数据的迭代方式不同。从IndexCursor.next()开始封装了不同的index迭代方式。另外还有关于对Transaction的支持，暂时忽略TODO
+
+IndexCursor.next()。
+对于不同的index，调用方法Cursor find(TableFilter filter, SearchRow first, SearchRow last)。传入Select的范围，获取Cursor，然后利用该Cursor进行遍历。
+*对于PageDataIndex，从root开始对BST进行二分查找到达Leaf结点，然后返回PageDataCursor
+*对于PageBtreeIndex，类似PageDataIndex的做法，从root开始到Leaf结点，返回PageBtreeCursor。
+*对于MVPrimaryIndex，底层同样也是遍历BST，但对于迭代器的封装更为模块化，具体如下：
+
+
+IndexCursor.next()
+------
+包含三层迭代器，由上到下分别为：MVPrimaryIndex.MVStoreCursor，TransactionMap.entryIterator().Iterator<Entry<K, V>>，org.h2.mvstore.Cursor<K, V>。
+
+TableFilter.next() -> IndexCursor.next() -> MVPrimaryIndex.MVStoreCursor.next() -> TransactionStore.TransactionMap.Iterator.next() -> org.h2.mvstore.Cursor.next()
+org.h2.mvstore.Cursor.next() -> Page.getKey(int index)/Page.getValue(int index)
+
+
+1.
+MVPrimaryIndex.MVStoreCursor
+--Entry<Value, Value> current
+--Iterator<Entry<Value, Value>> it
+--ValueLong last    //赋值为max
+MVPrimaryIndex提供给IndexCursor的接口。利用it遍历Entry元素，发现超过last的时候，则设置current为null，表示遍历结束。
+返回值给IndexCursor有两个方法
+getSearchRow()和get()实现一样，把DataUtils.MapEntry<K, V>转换为Row返回给IndexCursor。   
+类的实现逻辑和PageDataCursor一致
+
+MVSecondaryIndex.MVStoreCursor
+MVSecondaryIndex提供给IndexCursor的接口。
+逻辑和MVPrimaryIndex.MVStoreCursor类似，遍历元素，发现超过last，则结束遍历。返回值给IndexCursor有两个方法
+getSearchRow()只是简单转换K的值Row，只有row key以及索引列的值。
+get()会通过MVTable利用row key从MVPrimaryIndex中获取对应Row的所有值。   
+类的实现逻辑和PageBtreeCursor一致
+
+
+2.
+TransactionStore.TransactionMap.entryIterator().Iterator<Entry<K, V>>         //MVPrimaryIndex
+fetchNext()中调用TransactionMap.getValue(key, readLogId, data)                //getValue()查找key对应已提交或当前事务修改的值。
+把K，VersionedValue转换为DataUtils.MapEntry<K, V>，返回给MVStoreCursor。
+
+TransactionStore.TransactionMap.wrapIterator().Iterator<K>                  //MVSecondaryIndex
+fetchNext()中包括了includeUncommitted和containsKey()判断，当从Cursor获取了值后，如果includeUncommitted为true，直接返回。否则判断TransactionMap.containsKey()，如果不是已提交或当前事务修改，则跳过这个值。   
+
+返回K给MVStoreCursor。
+
+
+3.
+org.h2.mvstore.Cursor<K, V>
+--Page root
+--MVMap map
+--ValueLong from              //赋值为min
+--CursorPos pos
+--ValueLong current
+--K current, last;            //last为已经遍历了的Key，current为当前需要遍历的Key
+--V currentValue, lastValue;  //last为已经遍历了的Value，current为当前需要遍历的Value
+Cursor用于遍历MVMap的元素，从from开始按照map key 大小遍历Page到最后（没有max限制），如果找不到小于等于from的就直接找刚大于from的，等MVStoreCursor进行过滤。
+min()方法负责进行二分查找并记录对应的CursorPos，fetchNext()则负责按照CursorPos的位置获取下一个值。
+CursorPos保存遍历二叉查找树的位置信息，每个对象记录当前的Page，以及index，还有父结点的CursorPos引用parent。另外要注意，index对于leaf结点，则是刚好大于等于查找key的索引；对于node结点，则是index + 1，也就是下一个叶子结点的索引。这是因为当前leaf结点已经被遍历，返回到node结点时，就是需要直接遍历下一个leaf结点了。
+返回K，VersionedValue给2。
+利用Page提供的getKey(index)，getValue(index)返回key和value。
+Cursor直接遍历MVMap底层的BST，因此符合前缀索引的选择逻辑，注意map key中多个索引列的sortTypes可能不同。ValueDataType为map key类型。
+
+
+=====================
+      Insert
+=====================
+insert into test values(5, 'aaa')
+
+
+TransactionStore.TransactionMap<K, V>   //组合了MVMap以及Transaction对象，封装为具有事务特性的MVMap。
+--int mapId
+--long readLogId                  //TransactionMap读值时默认logId。当前事务更新不会立即可见，支持语句处理操作，如update test set id = id + 1。目前都为Long.MAX_VALUE
+--MVMap<K, VersionedValue> map    //写最新数据的存储map   Key: rowKey, Value: VersionedValue
+--Transaction transaction         //当前关联的Transaction对象。
+
+
+TransactionStore.VersionedValue    //operationId和对应value的封装对象
+--long operationId
+--Object value
+
+
+MVTable
+--MVPrimaryIndex primaryIndex;
+--TransactionStore store;
+--...    //剩下的基本和RegularTable差不多
+
+MVPrimaryIndex
+--MVTable mvTable;
+--String mapName;
+--TransactionMap<Value, Value> dataMap;     //数据接口对象。
+--long lastKey;
+
+
+Insert.insertRows():
+MVTable.lock()和RegularTable的lock()方法实现逻辑一样。
+MVTable.addRow(Session session, Row row)
+session.log(); 直接返回。已经在TransactionStore记录了undo日志。
+
+*****
+MVTable.addRow(Session session, Row row):
+从MVPrimaryIndex开始顺序遍历table的所有indexes调用Index.add(session, row);  (下面接着)
+如果add抛出异常失败，则调用Transaction.rollbackToSavepoint(savepoint);
+另外还有MultiVersionIndex判断？但已经不可能出现MultiVersionIndex？
+
+*****
+MVPrimaryIndex.add(Session session, Row row):
+1.首先根据mainIndexColumn设置row的rowKey。然后是getContainsLargeObject的LOB判断。这些和PageDataIndex逻辑一致。
+2.
+getMap(session) 
+-->
+TransactionMap<K, V> m = new TransactionMap<K, V>(transaction, map, mapId);
+m.setSavepoint(Long.MAX_VALUE));
+获取当前Session对应的TransactionMap，并设置savePoint，即readLogId最大。（所有的更新都可被当前事务可见）
+注意该TransactionMap底层的数据存储MVMap与MVPrimaryIndex.dataMap一致，也就是MVTable底层的存储。
+
+3.Value old = map.getLatest(key); (get(key, Long.MAX_VALUE);) 获取要插入rowKey的最新value，如果不为null，则抛出DUPLICATE_KEY_1异常。为nullL则接着执行。
+4.map.put(key, ValueArray.get(row.getValueList()));             (下面接着)
+插入row到Session对应的TransactionMap中。
+5.lastKey = Math.max(lastKey, row.getKey());
+
+最后，put成功以后，dataMap对应的key就为VersionedValue值，其中包含了operationId和具体的value值。此时还没有commit。
+
+undo日志记录的是之前的值，是null
+
+
+
+*****
+TransactionMap.put(K key, V value)：
+->set(key, value)
+V old = get(key);                       //获取当前key最新更新的值。下面分解
+boolean ok = trySet(key, value, false);  //下面分解
+trySet失败则抛出并发更新异常。
+
+*****
+-->1.  get(key):
+->VersionedValue data = map.get(key);  return getValue(key, maxLog, data);
+从存储map获取key保存的VersionedValue。
+
+TransactionMap.getValue(K key, long maxLog, VersionedValue data)
+根据rowKey和maxLog获取VersionedValue。注意判断data的事务ID和logID。
+1.如果data.operationId为0，则为已提交数据，直接返回。
+2.否则从operationId抽取transactionId，如果和当前TransactionMap.transaction的事务id相等，则为本事务添加，然后operationId抽取logID比maxLog小则返回data。以上都不属于则要undoLog读取值。
+3.从database所属的TransactionStore.undoLog.get(operationId)获取没提交事务修改前的data
+4.如果data为null，则可能transaction刚刚commit或rollback，但事务可能仍然打开状态。
+5.如果data仍然为null则已经被删除，否则继续判断，如果该data的事务id不是当前事务id，或者logID比当前大，则都要抛出并发更新异常。如果是当前事务修改且小于maxLogid，则返回该data。
+
+*****
+-->2.  trySet(K key, V value, boolean onlyIfUnchanged):
+尝试更新或者删除key指定的value，可以指定只有当map打开后key对应值仍然不变才执行操作（onlyIfUnchanged）。
+1.先直接从map获取key当前的值current。map.get(key)
+
+分支2.onlyIfUnchanged为true。首先利用readLogId读取map中key的值old，getValue(key, readLogId)，如果old和current相等就可以接着修改，否则继续判断，如果old的事务ID不同于当前事务ID，则直接返回false。如果是同一事务ID，如果value为null，则表示要删除之前添加的值，忽略。如果current.value为null，则表示之前删除了该值，现在进行添加，则这里直接跳到3继续执行添加操作。如果两者都不为null，证明要重新更新？return false？ 
+目前均为调用均为false。
+update test set id = id + 1?
+
+3.根据关联的Transaction以及value创建VersionedValue对象newValue，注意VersionedValue的operationId = ((long) transaction.transactionId << 40) | transaction.logId;
+
+分支4.如果current为null，则表示newValue需要进行添加操作。首先往当前事务添加undo日志（记录值为更新前旧值），log(int mapId, Object key, Object oldValue)，然后进行一个加锁的同步插入到map的操作，putIfAbsent(key, newValue)（synchronized方法），如果插入失败（可能有其它事务正在更新），则删除事务刚刚添加的undo日志，logUndo()，返回false。插入成功直接返回true。
+细节：Transaction.log()/logUndo()实现都是请求TransactionStore记录日志，TransactionStore利用MVMap保存undo日志（undoLog对象，key为operationID，value为{ mapId, key, oldValue }数组），由于属于database全局，因此需要synchronized同步。 
+
+分支5.current不为null，通过operationID获取事务ID，如果不为当前事务ID，则返回false。（已有其它事务进行修改，类似MVCC）否则为当前事务的修改，类似4的做法，首先Transaction记录undo日志，调用map.replace(key, current, newValue)（synchronized方法）更新值，成功返回true，失败则删除添加的undo日志，返回false。
+细节：replace()方法同样为synchronized，首先查看map中对应key的值是否和current相等，如果相等才修改对应值，否则返回false。
+
+
+           TransactionStore
+        ^                   ^
+        |                   |
+Transaction（Session）    Transaction（Session）  ...   (每个Session有单个Transaction引用TransactionStore)
+        ^
+        |
+TransactionMap(MVPrimaryIndex.datamap.map/mapId)  ... (MVPrimaryIndex.dataMap会负责创建属于该Session的TransactionMap，作为提供给该Session的接口查询数据)
+
+
+
+
+MVPrimaryIndex -> dataMap(TransactionMap  -> Transaction = null)
+
+
+*MVSecondaryIndex.add()
+------
+MVSecondaryIndex的插入逻辑与MVPrimaryIndex类似。但也有部分注意的地方。
+
+具体做法：首先是获取Session对应的TransactionMap map（getMap()和MVPrimaryIndex一样的实现），然后把row按照MVSecondaryIndex的index columns + row key转换成ValueArray作为map的key，如果不是unique索引，则直接插入(key, ValueNull)到map即可（插入过程和MVPrimaryIndex一样经过Transaction的判断）。
+
+这里的关键是要注意unique索引的处理：
+1.首先在插入map之前，找出已提交数据中，刚好大于等于插入row的row r2，如果插入row和r2不相等可以继续插入，否则要继续判断r2的ValueNull，调用BaseIndex.containsNullAndAllowMultipleNull()判断是否允许NULL的条件，如果不允许则抛出Duplicate key异常。（unique索引有几种情况允许null的存在，详细看代码）
+2.插入map之后，还要继续判断未提交数据是否含有重复索引，如果含有，抛出CONCURRENT_UPDATE_1异常。(为何不在插入前判断？)
+
+undo日志记录的是之前的值，是ValueNull
+
+
+
+=====================
+      Delete
+=====================
+delete from test where id = 4
+
+
+Delete.update()
+权限校验，加上共享表锁，以及where条件查询出需要delete的row。
+MVTable.removeRow删除row。
+Session.log()同样因为MVTable跳过Session的undo日志记录。
+
+*****
+MVTable.removeRow(Session session, Row row)
+和RegularTable一样，逆序遍历indexes，删除row。
+
+
+*****
+MVSecondaryIndex.remove(Session session, Row row)
+getMap()创建Session对应的TransactionMap，然后调用TransactionMap.remove(key)删除row，其实就是调用set(key, null)把key对应的值置为null。
+这里要注意，MVSecondaryIndex保存的键值为(key, VersionedValue.value = ValueNull)，值ValueNull虽然表示null，但事实是对象，与null不能混为一谈。
+
+VersionedValue.value变化：
+ValueNull -> null
+undo日志记录的是之前的值，也就是ValueNull
+
+
+*****
+MVPrimaryIndex.remove(Session session, Row row/)
+getMap()获取TransactionMap，TransactionMap.remove(key)删除row。
+
+VersionedValue.value变化：
+ValueArray -> null
+undo日志记录的是之前的值，也就是ValueArray
+
+
+=====================
+      Update
+=====================
+同样是先delete后insert。
+
+MVPrimaryIndex.dataMap.map包括有两个entry，一个是update前的key1，对应的value为null，另外一个是update后的key2，对应的value为更新row。
+
+
+create table test5(
+id int primary key,
+id1 int,
+v1 int,
+FOREIGN KEY(id1) REFERENCES (id)
+)
+
+========================
+      Transaction
+========================
+
+TransactionStore.Transaction [static class]  //每个Session对象有当前的一个Transaction对象
+--TransactionStore store
+--int transactionId                         //transactionId表示当前事务ID。由TransactionStore保证唯一。
+--long logId                                //TransactionStore.undoLog里记录的最后日志ID。 初始化时为0。Transaction.log()/rollbackToSavepoint()等会修改logId.
+初始化：Session.getTransaction()初始化Transaction对象。
+
+
+TransactionStore
+--MVMap<Long, Object[]> undoLog;            //undo日志记录 Key: {opId}, value: {mapId, key, oldValue}
+--MVStore store
+
+==========
+  commit
+==========
+Session.commit()
+Session.commit开始，和PageStore相比，由于不会写Session的undoLog，undo日志的commit由Transaction和TransactionStore负责。
+1.遍历获得共享锁的表locks，分别调用这些表的MVTable.commit()，(MVTable.commit只是增加database的modificationDataId。select的lastResult缓存相关）
+2.Transaction.commit() -> TransactionStore.commit()
+  通过从0开始递增到Transaction的logId，和TransactionId组合为operationId，这样就可以获得所有未提交修改对应的undo日志的key。通过TransactionStore.undoLog，找出该事务的所有undo日志。日志包含三个对象{mapId, rowKey, oldValue}，commit过程只需要利用mapId从TransactionStore.maps中找出undo记录对应的MVMap，然后从该map中根据rowKey找出未提交数据VersionedValue value，如果value为null，表示在之前的undo记录删除，因此忽略（如先insert后delete）；如果value.value为null，也就是当前事务删除值，则调用map.remove(key)删除该记录；如果value.value有值，则重新创建operationId为0，value相同的VersionedValue，map.put(key, value)插入即可。
+  顺利完成该undo日志的处理后，undoLog.remove(key)删除该undo日志的记录
+
+3.TransactionStore.endTransaction()
+当前没有已经begin并且修改了数据的事务（undoLog为空），并且MVStore中存在太多没有存储的page数（> 3/4最大值，最大值=19kb / pageSplitSize页面split大小）则调用MVStore.commit()刷新记录。
+
+
+------
+BackgroundWriterThread.run() -> MVStore.commitInBackground()
+除了事务显示commit外，MVStore有后台线程定时commit，刷新数据到硬盘。注意这是个多线程刷新，刷新的时候可能还在修改MVMap的数据。
+
+
+
+
+
+==========
+ rollback
+==========
+Session.rollback()
+同样，不会写Session的undoLog，rollback由TransactionStore负责。
+Session.rollbackTo()
+1.利用Iterator遍历，日志id从Transaction.logId逐渐减小到savepointId（如果全部rollback，则为0），同样和TransactionId组成operationId，通过TransactionStore.undoLog找出要rollback的所有undo日志。对于每条undo日志，根据mapId找到对应的MVMap，然后把mapName，rowKey，oldValue封装Change对象返回。mapName是通过mapId向MVStore.meta元数据查找出的名字。
+2.根据mapName找出对应的MVTable。由于MVPrimaryIndex的MVMap的mapName是table.xx，MVSecondaryIndex的mapName是index.xx。所以只对MVPrimaryIndex的undo日志执行rollback操作，通过构造UndoLogRecord重新调用MVTable进行remove/put操作。注意，此过程中会重新产生undo日志。另外此过程并没有删除undo日志。
+3.Transaction.commit()
+重新commit在rollback过程中产生undo日志。
+
+另外，Transaction.rollback()基本实现一致，并且rollback过程是直接对MVMap做修改，并不用通过MVTable，这样就不会产生重复的undo日志。但为何没有直接调用？
+应该是因为Transaction.rollback()会删除undo日志，然后后台刷新线程刚好把undo日志刷新到硬盘，但Transaction仍然没完成rollback （???应该会同步？），数据库突然crash，这样重启后recover会错误判断为commit事务。
+
+
+
+==========
+ Recover
+==========
+MVStore负责recover相关。
+1.undo日志是TransactionStore.undoLog，MVMap负责保存。
+2.MVTable表的索引MVPrimaryIndex和MVSecondaryIndex的数据组织内部同样也是由MVMap保存。
+因此只需要MVStore负责恢复MVMap即可。事实上，由于MVStore后台线程会定期commit，MVStore把符合要求MVMap的Page刷新到硬盘上，包括undo日志以及未提交的修改数据。所以当数据库crash重启后，会出现未提交数据在MVMap中，此时就需要利用undo日志进行recover操作。
+
+transaction状态：
+STATUS_CLOSED     = 0       a closed transaction (committed or rolled back)                    commit()/rollback()完成后设置。
+STATUS_OPEN       = 1       an opened but not commit or roll back yet transaction.             初始化时设置
+STATUS_PREPARED   = 2       a prepared transaction                                             2pc相关
+STATUS_COMMITTING = 3       being committed, but possibly not yet finished (Store is closed)   commit()中设置
+
+
+recover操作
+MVTableEngine.Store.initTransactions()
+调用TransactionStore.getOpenTransactions()恢复在关闭前，还没开始commit或需要rollback的（STATUS_OPEN）或者已经开始但没有完成commit（STATUS_COMMITTING）的各个transaction的状态。然后这些transaction的状态为STATUS_OPEN的需要rollback，STATUS_COMMITTING的需要commit。
+
+没有完成rollback是否错误判断为commit中？
+
+
+
+
+TODO
+多线程的更新。
+
+
+
+
+
+总结：
+PageStore是传统的物理undo/逻辑redo日志，checkpoint的时候进行提交数据的writeback以及已提交事务对应的undo日志删除对比，另外后台线程刷新undo/redo日志的时候会进行synchronized，从而会影响到修改数据的事务。
+MVStore的事务恢复机制，与
+
+
+
+
+
+==========
+Select
+==========
+
+
+
+
+
+==========
+Insert
+==========
+不同事务：
+Insert same row？     由于获取的VersionedValue为未提交事务写入，抛出ERROR_TRANSACTION_LOCKED异常
+Inserted and delete？ Inserted无法被select
+Inserted and update？ Inserted无法被select
+
+同一事务：
+Insert same row？  MVPrimaryIndex.add()抛出DUPLICATE_KEY_1异常
+
+
+
+==========
+Delete
+==========
+
 
 
 TODO:
 
+FOR UPDATE
+
+
 Select
 //order by --  TimSort!!  http://svn.python.org/projects/python/trunk/Objects/listsort.txt
 
-FOR UPDATE
 
+View实现
+//FOREIGN KEY
+
+
+compact
+close database...Database.closeOpenFilesAndUnlock()
 
 
 //TCP server
 // memtable
-
-//FOREIGN KEY
-
-//MVStore engine
-
-//MVCC ?  database.isMultiVersion()
-//MULTI_THREADED
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
