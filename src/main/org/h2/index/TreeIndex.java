@@ -282,6 +282,7 @@ public class TreeIndex extends BaseIndex {
                 if (withKey) {
                     return x;
                 }
+
                 x = x.left;
             } else if (compare > 0) {
                 x = x.left;

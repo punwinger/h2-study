@@ -446,7 +446,7 @@ public class TransactionStore {
         // and if there have been many changes, store them now
         if (undoLog.isEmpty()) {
             int unsaved = store.getUnsavedPageCount();
-            int max = store.getAutoCommitPageCount();
+            int max = store.getAutoCommitPageCount  ();
             // save at 3/4 capacity
             if (unsaved * 4 > max * 3) {
                 store.commit();

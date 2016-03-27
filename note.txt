@@ -1200,6 +1200,12 @@ RegularTable初始化index的时候，除了scanIndex，其它都被封装到Mul
 MultiVersionIndex封装了原来的二级索引，并且创建delta作为差异更新，delta的索引列和原来的二级索引一致，因此compareRows的时候只比较对应的索引列，另外compareKeys则会当key相同时，继续比较version，version越大则越小。
 delta是TreeIndex（内存AVL树，AVL树是自平衡二叉搜索树，以发明者命名），add/remove的时候会自动进行balance操作，add会根据LL（右旋转）、RR（左旋转）、LR（下部分左旋转，整个部分右旋转）、RL（下部分右旋转，整个部分左旋转）进行结点旋转。remove的操作类似（但要注意remove的结点有left和right的时候）。H2的实现利用balance因子记录子树平衡情况，然后进行结点替换。
 
+注意：这里采用AVL树保存Row数据，而不是类似B+树。Row数据作为键值保存到AVL树结点中。应该是考虑到delta数据量不大，能够放内存，更适合于BST树结构。
+
+AVL树等BST树，是二叉树，每个结点只保存一个键值。适合于数据量较小，可以快速进行查找。
+B+树是多叉树，目的是深度尽可能少，查找时减少IO。更适合于大量数据，需要与硬盘IO操作的情况。
+
+
 Command.filterConcurrentUpdate()发现更新同一row，等待后重试，超时则抛出异常
 
 
@@ -1363,7 +1369,7 @@ no length limits
 **BLOB Support
 
 **Concurrent Operations and Caching
-LIRS cache, against scan?  https://en.wikipedia.org/wiki/LIRS_caching_algorithm
+LIRS cache, against scan  https://en.wikipedia.org/wiki/LIRS_caching_algorithm
 NOT support concurrent modification
 MVMapConcurrent support concurrent read, write must after first read
 sharding to multiple maps support concurrent write
@@ -1380,6 +1386,86 @@ write only once, B-tree pages are always full for easily compressed.
 **Metadata Map
 
 设计上MVMap的接口已经考虑好Session的multi-thread并发修改，在需要的地方添加了synchronized关键字
+
+
+=====================
+      LIRS
+=====================
+    LIRS是对比访问Page的IRR判断块访问频率的cache替换算法。MVStore利用hash分片的方法进行扩展实现并发LIRS。H2使用多个Segment响应cache请求，每个Segment都是一个独立的LIRS实现。
+
+总内存maxMemory默认为16MB内存，平均分配到16个Segment，每个Segment为1MB。averageMemory为每个entry内存估计，值固定为pageSplitSize / 2。
+总内存利用平均分配，如果出现倾斜，会影响内存利用率，应该考虑某个Segment使用率较高时，会steal其它空闲的Segment，还有averageMemory为固定值，不能准确反映cache状况。
+
+分配方法：
+1.限制Segment数量segmentCount为2的乘幂
+2.segmentMask = segmentCount - 1
+3.segmentShift则为segmentCount的末尾0的个数，
+4.通过以下算式映射hash值到不同的Segment中：
+int segmentIndex = (hash >>> segmentShift) & segmentMask
+
+
+LIRS主要的put，get，remove操作都是通过hash到具体的Segment进行操作。每个Segment都会进行必要的synchronized。
+Segment
+--Entry<V>[] entries;   Map容器，Hash映射Segment所有的entry，快速查找对应的entry
+--Entry<V> stack;       LIRS栈
+--Entry<V> queue;       驻cache的FIFO队列
+--Entry<V> queue2;      非驻cache的FIFO队列（防止entry数量过多）
+
+Entry数据结构主要用于保存key，value值以及链表结构的Prev，Next引用等。
+    LIRS的链表是从头部入列元素，尾部出列元素，其实现使用了dummy node的做法：初始化stack/queue为dummy node，该dummy node的Prev作为链表尾部引用，引用尾部元素；Next作为链表头部引用，引用头部元素。初始化空链表时，Prev和Next均指向自己，这样插入和删除元素的时候，就不用显示去修改链表尾部引用和头部引用。
+
+------
+ Put
+------
+put(long key, int hash, V value, int memory)
+1.删除原来key映射的entry
+2.根据Key，Value构造Entry e，然后插入Map容器entries。
+3.如果内存总量超过阈值，则需要找到cold entry替换出cache（evict方法）
+4.新的entry e插入stack头部（所有的新entry，无论是cold或是hot都要插入）
+
+evict(Entry<V> newCold)
+1.驻cache的FIFO队列queue小于stack的1/32时（3.125%），把栈底部的hot entry转换为cold entry，也就是从栈删除并插入queue的头部，同时执行"栈裁剪"操作
+2.把newCold插入queue的头部
+3.当queue大小大于1时，循环把queue的尾部元素替换出cache，并同时插入到queue2中，直到可用内存小于阈值。如果queue2的大小*2超过栈大小，则循环remove queue2尾部元素。
+
+对比起原论文中，这里的put实现了改进：
+使用queue2记录了非驻cache的cold entry，当超过一定大小的时候，就会从queue2尾部（时间最长的cold entry）开始remove entry，，这样可以避免栈长度过大；
+
+其它部分和论文描述几乎一致
+
+
+------
+Remove
+------
+remove(long key, int hash)
+1.Map容器entries中通过hash映射到entry e
+2.如果e在栈中，从栈中移除
+3.如果是hot entry，则把queue中entry（驻cache的cold entry）的头部元素变为hot entry（先从queue中删除即可，如果已在栈S即可，否则还需要重新插入栈S的尾部）。这样是为了尽量保持hot entry的数量一致
+4.如果是cold entry，则从queue/queue2中删除。
+5.执行“栈裁剪”操作。
+
+删除hot entry的时候，注意从queue中的cold entry变为为hot entry的操作。
+
+
+------
+ Get
+------
+get(long key, int hash)
+1.利用Map容器entries通过hash映射到entry e
+2.如果没找到e，或者e为非驻cache的cold entry，则返回null
+3.否则就执行access(key, hash)，也就是尝试将e移动到栈或queue的顶部
+
+access(key, hash)
+1.利用Map容器entries通过hash映射到entry e
+2.如果e是hot entry，并且不是位于栈头部元素，而且距离上次栈头部插入元素大于stackMoveDistance的时候，则会把e插入栈的头部，如果e是位于栈尾部，则执行“栈裁剪”操作
+3.如果e是cold entry，首先从queue中删除e，然后如果e在栈中的话（这是一个把cold entry变为hot entry的操作），则需要把e先从栈删除，然后把栈底部的hot entry变为cold entry，如果e不在栈中，则重新插入queue的头部。最后再插入栈头部。
+
+get可以算作一个访问操作，因此access操作中，需要把满足一定条件的entry重新插入栈/queue的头部。
+
+
+总体上来看，H2的LIRS实现采用了hash分片锁同步的做法，加大并发，同时在每个Segmenet中采用queue2限制栈的大小。实现简洁，基本和原论文描述一致。
+
+
 
 =====================
       初始化
@@ -1405,21 +1491,26 @@ file format
 File Header 1
 File Header 2
 Chunk
+-->header
 -->Page
 -->Page
 -->Page
+-->footer
 Chunk
+-->header
 -->Page
 -->Page
 -->Page
+-->footer
 Chunk
+-->header
 -->Page
 -->Page
 -->Page
+-->footer
 
 
 Map:
-
 MVMap<K, V>
 ------
 volatile Page root;                         
@@ -1432,9 +1523,9 @@ final DataType valueType;
 ArrayList<Page> oldRoots                    store old root?
 
 
-MVMap内部结构是BST。
+MVMap实现了Copy-On-Write的B+树。
 
-init() 
+init()
 MVMap的createVersion和writeVersion都初始化为MVStore的当前版本值currentVersion。同时id为MVStore传入。
 
 
@@ -1466,7 +1557,7 @@ put方法:
 设置并发修改版本为-1
 
 
-get(key)方法就是从root开始二分查找BST。
+get(key)方法就是从root开始二分查找B+树。
 
 
 MVMapConcurrent
@@ -1483,6 +1574,15 @@ MVStore
 1.元数据
 MVMapConcurrent<String, String> meta           负责记录每个MVMap的元数据。包括id，name，page root的pos，config(name,type还有createVersion，为第一次创建MVMap的时候MVStore.currentVersion的值)
 ConcurrentHashMap<Integer, MVMap<?, ?>> maps   缓存id和对应的MVMap
+
+读取文件头的时候初始化meta，文件头大致如下：H:2,block:5,blockSize:1000,chunk:d9,created:152cb564ddd,format:1,version:d9,fletcher:21ec9357
+MVStore.readFileHeader()
+1.重复读取两个文件头。每个文件头处理一致：读取文件头到bytebuffer；计算文件头的fletcher32校验和，查看结果值和文件头的fletcher值是否相等；保存属性version为newestVersion，block为chunkBlock，created为creationTime；校验创建时间戳creationTime。
+
+2.readChunkFooter()读取文件最后的Chunk footer。如果该Chunk的version大于文件头的newestVersion，则newestVersion和chunkBlock更新为该chunk的对应值。
+
+3.readChunkHeader()读取chunkBlock*BLOCK_SIZE偏移的Chunk header。
+
 
 
 openMap(name, builder)
@@ -1516,7 +1616,7 @@ compact()
 
 Page
 ------
-Page是MVMap的BST结构对象。可以作为node和leaf结点。
+Page是MVMap的B+树结构对象。可以作为node和leaf结点。
 
 Page
 --MVMap map
@@ -1534,7 +1634,7 @@ Page的insert采用递归式从上至下的insert node方式，首先判断插�
 缺点：需要多次binary search。。。
 
 
-Page的BST结构和PageBtreeLeaf/PageDataLeaf大致相同。
+Page的B+树结构和PageBtreeLeaf/PageDataLeaf大致相同。
 Node结点时，keys[i]的值为childrenPages[i]和children[i]所指的childrenPage的最大值，该子结点范围为[keys[i - 1], keys[i])。
 leaf结点之间同样没有链接，要遍历下一个叶子结点，必须递归查询父node结点，获取兄弟叶子结点。
 
@@ -1606,13 +1706,13 @@ TransactionMap.entryIterator(min)
 
 select xxx from test where xxx
 ------
-Select操作符层的逻辑基本没变，关键是MVStore层对数据的迭代方式不同。从IndexCursor.next()开始封装了不同的index迭代方式。另外还有关于对Transaction的支持，暂时忽略TODO
+Select操作符层的逻辑基本没变，关键是MVStore层对数据的迭代方式不同。从IndexCursor.next()开始封装了不同的index迭代方式。另外还有关于对Transaction的支持。
 
 IndexCursor.next()。
 对于不同的index，调用方法Cursor find(TableFilter filter, SearchRow first, SearchRow last)。传入Select的范围，获取Cursor，然后利用该Cursor进行遍历。
-*对于PageDataIndex，从root开始对BST进行二分查找到达Leaf结点，然后返回PageDataCursor
+*对于PageDataIndex，从root开始对B+树进行二分查找到达Leaf结点，然后返回PageDataCursor
 *对于PageBtreeIndex，类似PageDataIndex的做法，从root开始到Leaf结点，返回PageBtreeCursor。
-*对于MVPrimaryIndex，底层同样也是遍历BST，但对于迭代器的封装更为模块化，具体如下：
+*对于MVPrimaryIndex，底层同样也是遍历B+树，但对于迭代器的封装更为模块化，具体如下：
 
 
 IndexCursor.next()
@@ -1666,7 +1766,7 @@ min()方法负责进行二分查找并记录对应的CursorPos，fetchNext()则�
 CursorPos保存遍历二叉查找树的位置信息，每个对象记录当前的Page，以及index，还有父结点的CursorPos引用parent。另外要注意，index对于leaf结点，则是刚好大于等于查找key的索引；对于node结点，则是index + 1，也就是下一个叶子结点的索引。这是因为当前leaf结点已经被遍历，返回到node结点时，就是需要直接遍历下一个leaf结点了。
 返回K，VersionedValue给2。
 利用Page提供的getKey(index)，getValue(index)返回key和value。
-Cursor直接遍历MVMap底层的BST，因此符合前缀索引的选择逻辑，注意map key中多个索引列的sortTypes可能不同。ValueDataType为map key类型。
+Cursor直接遍历MVMap底层的B+树，因此符合前缀索引的选择逻辑，注意map key中多个索引列的sortTypes可能不同。ValueDataType为map key类型。
 
 
 =====================
@@ -1870,17 +1970,17 @@ Session.commit()
 Session.commit开始，和PageStore相比，由于不会写Session的undoLog，undo日志的commit由Transaction和TransactionStore负责。
 1.遍历获得共享锁的表locks，分别调用这些表的MVTable.commit()，(MVTable.commit只是增加database的modificationDataId。select的lastResult缓存相关）
 2.Transaction.commit() -> TransactionStore.commit()
-  通过从0开始递增到Transaction的logId，和TransactionId组合为operationId，这样就可以获得所有未提交修改对应的undo日志的key。通过TransactionStore.undoLog，找出该事务的所有undo日志。日志包含三个对象{mapId, rowKey, oldValue}，commit过程只需要利用mapId从TransactionStore.maps中找出undo记录对应的MVMap，然后从该map中根据rowKey找出未提交数据VersionedValue value，如果value为null，表示在之前的undo记录删除，因此忽略（如先insert后delete）；如果value.value为null，也就是当前事务删除值，则调用map.remove(key)删除该记录；如果value.value有值，则重新创建operationId为0，value相同的VersionedValue，map.put(key, value)插入即可。
+  通过从0开始递增到Transaction的logId，和TransactionId组合为operationId，这样就可以获得所有未提交修改对应的undo日志的key。通过TransactionStore.undoLog，找出该事务的所有undo日志，注意如果logId返回的undo日志为空，则可能因为在之前commit过程中删除了部分undo日志，但没有完成commit却发生了crash，因此重新找到下一条该事务提交的undo日志，继续上次没有完成的commit。
+  日志包含三个对象{mapId, rowKey, oldValue}，commit过程只需要利用mapId从TransactionStore.maps中找出undo记录对应的MVMap，然后从该map中根据rowKey找出未提交数据VersionedValue value，如果value为null，表示在之前的undo记录删除，因此忽略（如先insert后delete）；如果value.value为null，也就是当前事务删除值，则调用map.remove(key)删除该记录；如果value.value有值，则重新创建operationId为0，value相同的VersionedValue，map.put(key, value)插入即可。
   顺利完成该undo日志的处理后，undoLog.remove(key)删除该undo日志的记录
 
 3.TransactionStore.endTransaction()
-当前没有已经begin并且修改了数据的事务（undoLog为空），并且MVStore中存在太多没有存储的page数（> 3/4最大值，最大值=19kb / pageSplitSize页面split大小）则调用MVStore.commit()刷新记录。
+当前没有已经begin并且修改了数据的事务（undoLog为空），并且MVStore中存在太多脏page数（> 3/4最大值，最大值=19kb / pageSplitSize页面split大小）则调用MVStore.commit()刷新记录。
 
 
 ------
 BackgroundWriterThread.run() -> MVStore.commitInBackground()
 除了事务显示commit外，MVStore有后台线程定时commit，刷新数据到硬盘。注意这是个多线程刷新，刷新的时候可能还在修改MVMap的数据。
-
 
 
 
@@ -1896,8 +1996,23 @@ Session.rollbackTo()
 3.Transaction.commit()
 重新commit在rollback过程中产生undo日志。
 
-另外，Transaction.rollback()基本实现一致，并且rollback过程是直接对MVMap做修改，并不用通过MVTable，这样就不会产生重复的undo日志。但为何没有直接调用？
-应该是因为Transaction.rollback()会删除undo日志，然后后台刷新线程刚好把undo日志刷新到硬盘，但Transaction仍然没完成rollback （???应该会同步？），数据库突然crash，这样重启后recover会错误判断为commit事务。
+
+TransactionStore.rollbackTo()
+与Session.rollbackTo类似，但会在完成undo操作后，直接删除undo日志，比前者要方便简单。另外就算在该过程crash，也不会出现问题，因为每个步骤都是可逆的。
+
+
+
+总结：
+要注意区分commit和rollback：
+1.commit在redo过程中会删除undo日志，rollback并不会删除任何undo日志，相反还会写入新的undo日志，直到完全rollback完成后再次commit才会删除undo日志。
+2.rollback删除undo日志是从最大的logId开始到0的，commit是从0开始到最大的logId
+3.commit和rollback都必须先执行操作后删除undo日志
+4.Session.rollback先undo所有更改后再commit删除所有undo日志。TransactionStore.rollbackTo则在undo一个操作后，马上删除对应undo日志。两者过程中遇到crash都可以recover。相比较，insert和delete都是先写undo日志，然后再更新数据。
+
+
+
+savepoint x1;
+ROLLBACK TO SAVEPOINT x1;
 
 
 
@@ -1920,13 +2035,14 @@ recover操作
 MVTableEngine.Store.initTransactions()
 调用TransactionStore.getOpenTransactions()恢复在关闭前，还没开始commit或需要rollback的（STATUS_OPEN）或者已经开始但没有完成commit（STATUS_COMMITTING）的各个transaction的状态。然后这些transaction的状态为STATUS_OPEN的需要rollback，STATUS_COMMITTING的需要commit。
 
-没有完成rollback是否错误判断为commit中？
+注意此时的rollback，执行的是Transaction.rollback()，会执行日志删除！
+
+总结：
+1.MVStore的recover步骤，对于非STATUS_COMMITTING状态的事务（还没开始commit）都会进行undo操作。
+2.MVStore认定只有Transaction至少logId >= 0的undo日志被删除，这样Transaction才算处于STATUS_COMMITTING，如果发生crash，recover步骤就会redo这些事务。rollback则只有当rollback操作完成后，后续执行的Transaction.commit()才开始删除undo日志。
 
 
-
-
-TODO
-多线程的更新。
+https://groups.google.com/forum/#!forum/h2-database
 
 
 
@@ -1935,6 +2051,13 @@ TODO
 总结：
 PageStore是传统的物理undo/逻辑redo日志，checkpoint的时候进行提交数据的writeback以及已提交事务对应的undo日志删除对比，另外后台线程刷新undo/redo日志的时候会进行synchronized，从而会影响到修改数据的事务。
 MVStore的事务恢复机制，与
+
+
+
+
+TODO
+多线程的更新。
+MVMap.waitUntilWritten()
 
 
 
@@ -1956,8 +2079,11 @@ Insert same row？     由于获取的VersionedValue为未提交事务写入，�
 Inserted and delete？ Inserted无法被select
 Inserted and update？ Inserted无法被select
 
+
 同一事务：
 Insert same row？  MVPrimaryIndex.add()抛出DUPLICATE_KEY_1异常
+
+
 
 
 
@@ -1986,6 +2112,7 @@ close database...Database.closeOpenFilesAndUnlock()
 
 //TCP server
 // memtable
+
 
 
 
