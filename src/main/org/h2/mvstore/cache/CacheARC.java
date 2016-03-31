@@ -3,16 +3,17 @@ package org.h2.mvstore.cache;
 /**
  * Adaptive Replacement Cache.
  * See
- * ARC: A SELF-TUNING, LOW OVERHEAD REPLACEMENT CACHE.
- * Nimrod Megiddo and Dharmendra S. Modha
+ * ARC: A SELF-TUNING, LOW OVERHEAD REPLACEMENT CACHE. Nimrod Megiddo and Dharmendra S. Modha
  */
 public class CacheARC<V> {
 
+    //size is [0, sizeCache]
     private Entry<V> list1;
 
     //mid1 refer to the last entry of T1
     private Entry<V> mid1;
 
+    //size is [0, 2 * sizeCache]
     private Entry<V> list2;
 
     //mid2 refer to the last entry of T2
@@ -31,15 +32,13 @@ public class CacheARC<V> {
     private int p;
 
     //Map entries.
-    //Better HashMap for
+    //Better Implement for
     // 1. key is long, not need to create object
-    // 2. better customized hash function see answered by Thomas Mueller
+    // 2. better customized hash function. see answered by Thomas Mueller
     // http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
     private Entry<V>[] entries;
 
-
-
-    private static class Entry<V> {
+    static class Entry<V> {
         private static final int NOT_IN_LIST = -1;
         private static final int IN_T1 = 0;
         private static final int IN_B1 = 1;
@@ -57,6 +56,22 @@ public class CacheARC<V> {
         Entry<V> mapNext;
 
         int posType = NOT_IN_LIST;
+
+        boolean isInT1() {
+            return posType == IN_T1;
+        }
+
+        boolean isInB1() {
+            return posType == IN_B1;
+        }
+
+        boolean isInT2() {
+            return posType == IN_T2;
+        }
+
+        boolean isInB2() {
+            return posType == IN_B2;
+        }
     }
 
 
@@ -77,6 +92,59 @@ public class CacheARC<V> {
         mid2 = list2;
     }
 
+    public V get(long key) {
+        int hash = getHash(key);
+
+        Entry<V> e = find(key, hash);
+        if (e == null) {
+            return null;
+        }
+
+        //move to the relative list head, IN_B1 -> B1, IN_T2 -> T2 etc
+        removeFromList(e);
+        if (e.posType == Entry.IN_B1) {
+            addToMRU(e, mid1);
+        } else if (e.posType == Entry.IN_B2) {
+            addToMRU(e, mid2);
+        } else if (e.posType == Entry.IN_T1) {
+            addToMRU(e, list1);
+        } else {
+            addToMRU(e, list2);
+        }
+
+        return e.value;
+    }
+
+    public V remove(long key) {
+        int hash = getHash(key);
+
+        Entry<V> e = find(key, hash);
+        if (e == null) {
+            return null;
+        }
+
+        V oldVal = e.value;
+        e.value = null;
+
+        removeFromList(e);
+
+        //remove from entries
+        int idx = hash & (entries.length - 1);
+        if (entries[idx] == e) {
+            entries[idx] = e.mapNext;
+        } else {
+            Entry<V> pre = entries[idx];
+            while (pre.mapNext != e) {
+                pre = pre.mapNext;
+            }
+            pre.mapNext = e.mapNext;
+        }
+
+        sizeAdjust(e.posType, Entry.NOT_IN_LIST);
+
+
+        return oldVal;
+    }
 
     public V put(long key, V value) {
         int hash = getHash(key);
@@ -86,15 +154,42 @@ public class CacheARC<V> {
         V old = null;
 
         if (e == null) {
+            e = new Entry<V>();
+            e.key = key;
+            e.value = value;
+            int idx = hash & (entries.length - 1);
+            e.mapNext = entries[idx];
+            entries[idx] = e;
+
             if (sizeT1 + sizeB1 == sizeCache) {
                 if (sizeT1 < sizeCache) {
-
-                } else {
-
+                    replaceCache(e);
                 }
-            } else {
 
+                Entry<V> replace = list1.prev;
+                replace.value = null;
+                removeFromList(replace);
+                sizeAdjust(replace.posType, Entry.NOT_IN_LIST);
+                replace.posType = Entry.NOT_IN_LIST;
+            } else {
+                //sizeT1 + sizeB1 < sizeCache
+                if (sizeT1 + sizeT2 + sizeB1 + sizeB2 >= sizeCache) {
+                    if (sizeT1 + sizeT2 + sizeB1 + sizeB2 == 2 * sizeCache) {
+                        //delete LRU page in B2
+                        Entry<V> replace = list2.prev;
+                        removeFromList(replace);
+                        sizeAdjust(replace.posType, Entry.NOT_IN_LIST);
+                        replace.posType = Entry.NOT_IN_LIST;
+                    }
+
+                    replaceCache(e);
+                }
             }
+
+            //move to the head of T1
+            addToMRU(e, list1);
+            sizeAdjust(e.posType, Entry.IN_T1);
+            e.posType = Entry.IN_T1;
 
         } else {
             if (e.posType == Entry.IN_B1 || e.posType == Entry.IN_B2) {
@@ -102,8 +197,8 @@ public class CacheARC<V> {
                 replaceCache(e);
             }
 
-            // move to the head of T2
             removeFromList(e);
+            // move to the head of T2
             addToMRU(e, list2);
             sizeAdjust(e.posType, Entry.IN_T2);
             e.posType = Entry.IN_T2;
@@ -113,6 +208,21 @@ public class CacheARC<V> {
         }
 
         return old;
+    }
+
+
+    public void clear() {
+        entries = new Entry[2 * sizeCache];
+
+        list1 = new Entry<V>();
+        list1.prev = list1.next = list1;
+        mid1 = list1;
+
+        list2 = new Entry<V>();
+        list2.prev = list2.next = list2;
+        mid2 = list2;
+
+        sizeT1 = sizeT2 = sizeB1 = sizeB2 = p = 0;
     }
 
     private void sizeAdjust(int oldPos, int newPos) {
@@ -156,23 +266,46 @@ public class CacheARC<V> {
         e.prev = list;
         list.next.prev = e;
         list.next = e;
+
+        if (list == list1 && mid1 == list1) {
+            mid1 = list1.next;
+        } else if (list == list2 && mid2 == list2) {
+            mid2 = list2.next;
+        }
     }
 
     private void replaceCache(Entry<V> e) {
+        //because remove will delete any entry in T1 or T2
+        //so here must check if cache is full or not
+        if (sizeT1 + sizeT2 < sizeCache) {
+            return;
+        }
+
         if (sizeT1 > 0 && (sizeT1 > p || (sizeT1 == p && e.posType == Entry.IN_B2))) {
-            mid1.value = null;
+            Entry<V> m = mid1;
+            m.value = null;
             mid1 = mid1.prev;
+
+            sizeAdjust(m.posType, Entry.IN_B1);
+            m.posType = Entry.IN_B1;
         } else {
+            Entry<V> m = mid2;
+            m.value = null;
             mid2.value = null;
             mid2 = mid2.prev;
+
+            sizeAdjust(m.posType, Entry.IN_B2);
+            m.posType = Entry.IN_B2;
         }
     }
 
     private void adaption(boolean in_b1) {
         if (in_b1) {
             p += sizeB1 >= sizeB2 ? 1 : sizeB2 / sizeB1;
+            p = Math.min(p, sizeCache);
         } else {
             p -= sizeB2 >= sizeB1 ? 1 : sizeB1 / sizeB2;
+            p = Math.max(p, 0);
         }
     }
 
@@ -194,6 +327,7 @@ public class CacheARC<V> {
         return res;
     }
 
+
     static int getHash(long key) {
         //copy from CacheLongKeyLIRS
         //http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
@@ -204,6 +338,50 @@ public class CacheARC<V> {
         hash = ((hash >>> 16) ^ hash) * 0x45d9f3b;
         hash = (hash >>> 16) ^ hash;
         return hash;
+    }
+
+    // for test
+    // 0 is T1, 1 is B1, 2 is T2, 3 is B2
+    Entry<V>[][] getList() {
+        Entry<V>[][] res = new Entry[4][2 * sizeCache];
+        int i = 0;
+        for (Entry<V> e = list1.next; e != mid1.next; e = e.next) {
+            res[0][i++] = e;
+        }
+
+        i = 0;
+        for (Entry<V> e = mid1.next; e != list1; e = e.next) {
+            res[1][i++] = e;
+        }
+
+        i = 0;
+        for (Entry<V> e = list2.next; e != mid2.next; e = e.next) {
+            res[2][i++] = e;
+        }
+
+        i = 0;
+        for (Entry<V> e = mid2.next; e != list2; e = e.next) {
+            res[3][i++] = e;
+        }
+
+
+        return res;
+    }
+
+    public int getSizeT1() {
+        return sizeT1;
+    }
+
+    public int getSizeB1() {
+        return sizeB1;
+    }
+
+    public int getSizeT2() {
+        return sizeT2;
+    }
+
+    public int getSizeB2() {
+        return sizeB2;
     }
 
 }
