@@ -108,6 +108,9 @@ public class Data {
      */
     private final DataHandler handler;
 
+
+    private static char[] charBuffer = new char[1024 * 1024];
+
     private Data(DataHandler handler, byte[] data) {
         this.handler = handler;
         this.data = data;
@@ -183,9 +186,17 @@ public class Data {
      * @return the number of bytes required
      */
     private static int getStringWithoutLengthLen(String s, int len) {
+        char[] cBuffer = null;
+        if (len <= charBuffer.length) {
+            cBuffer = charBuffer;
+        } else {
+            cBuffer = new char[len];
+        }
+        s.getChars(0, len, cBuffer, 0);
+
         int plus = 0;
         for (int i = 0; i < len; i++) {
-            char c = s.charAt(i);
+            char c = cBuffer[i];
             if (c >= 0x800) {
                 plus += 2;
             } else if (c >= 0x80) {
@@ -258,10 +269,18 @@ public class Data {
      * @param len the number of characters to write
      */
     private void writeStringWithoutLength(String s, int len) {
+        char[] cBuffer = null;
+        if (len <= charBuffer.length) {
+            cBuffer = charBuffer;
+        } else {
+            cBuffer = new char[len];
+        }
+        s.getChars(0, len, cBuffer, 0);
+
         int p = pos;
         byte[] buff = data;
         for (int i = 0; i < len; i++) {
-            int c = s.charAt(i);
+            int c = cBuffer[i];
             if (c < 0x80) {
                 buff[p++] = (byte) c;
             } else if (c >= 0x800) {

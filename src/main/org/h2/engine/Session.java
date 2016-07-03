@@ -19,6 +19,7 @@ import org.h2.command.Parser;
 import org.h2.command.Prepared;
 import org.h2.command.dml.SetTypes;
 import org.h2.constraint.Constraint;
+import org.h2.faststore.lock.LockEntity;
 import org.h2.index.Index;
 import org.h2.jdbc.JdbcConnection;
 import org.h2.message.DbException;
@@ -1463,6 +1464,18 @@ public class Session extends SessionWithState {
          * The transaction savepoint id.
          */
         long transactionSavepoint;
+    }
+
+
+    //======================== For FastStore ========================
+    private LockEntity waitForEntity;
+
+    public void setWaitForEntity(LockEntity entity) {
+        waitForEntity = entity;
+    }
+
+    public LockEntity getWaitForEntity() {
+        return waitForEntity;
     }
 
 }

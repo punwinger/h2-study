@@ -761,6 +761,9 @@ insert into test4 values(14, 14);
 3、Insert.update()执行命令。
 
 
+Insert -> PageDataIndex/PageBtreeIndex -> PageDataNode,Leaf/PageBtreeNode,Leaf
+
+
 insert into test4 values(13, 13);
 -Insert.insertRows()
 ..将values列表的值按照插入对应的Column定义的类型进行转换，然后对每一行插入数据进行操作：按照默认值更新NULL值，检查插入值限制，精度转换，Sequence值更新操作。
@@ -947,7 +950,7 @@ Update.update()
 
 ***********************************************************************************************************************
 =======================================================================================================================
-日志恢复机制。
+日志恢复机制。 steal, no-force缓存策略，因此需要undo/redo操作.
 
 begin;
 insert into test3 select max(id) + 1, 15, 15 from test3;
@@ -993,8 +996,7 @@ WriterThread定时刷新undo/redo日志，默认500ms刷新一次。另外可以
 checkpoint机制：
 每次PageStore.commit()的时候，都会检查undo日志大小，超过一定大小（默认阀值DEFAULT_MAX_LOG_SIZE，16MB）则调用PageStore.checkpoint()。主要目的是清除不必要的日志，具体是找出当前所有正在连接的session的当前没有提交事务的最小logID，logID指定某个checkpoint的位置，删除这个checkpoint之前所有的日志即可。要注意必须首先writeback所有修改过的记录的页面到硬盘，才能进行日志删除操作，这样才能确保已经提交的记录持久化。
 
-总结：commit延迟写机制可以减轻IO，提高性能，但提高了丢失数据的风险，事实上undo/redo日志的实现保证在延迟刷新的时间内，最多只有一个page的数据保留在内存中（参见字节流写入
-机制），因此最多只有一个page的undo/redo日志数据丢失。由于使用的是undo/redo日志，因此记录刷新不用强制要求在commit的时候执行，H2规定只在checkpoint的时候执行，批量的page延迟写入能避免插入过程产生大量IO。
+总结：commit延迟写机制可以减轻IO，提高性能，但提高了丢失数据的风险，事实上undo/redo日志的实现保证在延迟刷新的时间内，最多只有一个page的数据保留在内存中（参见字节流写入机制），因此最多只有一个page的undo/redo日志数据丢失。由于使用的是undo/redo日志，因此记录刷新不用强制要求在commit的时候执行，H2规定只在checkpoint的时候执行，批量的page延迟写入能避免插入过程产生大量IO。
 
 PageStore成员变量。
 PageLog属于undo/redo机制，需要不断地写入日志数据，利用PageOutputStream完成底层写入操作。另外如下类型页面都需要添加undo log：
@@ -1044,6 +1046,8 @@ PageStore.recover()
 
 流程：
 1. RECOVERY_STAGE_UNDO阶段。
+从没有脏数据的checkpoint开始！保证undo能避免所有没提交事务的脏数据。checkpoint位置记录在文件头中！
+
 顺序读取undo/redo日志，对不同类型的日志进行处理：
 UNDO。则把page的data读出，解压后，写入硬盘。注意尽管多个checkpoint阶段中，同一page出现多次，但UNDO中一个page只写一次。
 CHECKPOINT。logId++，记录checkpoint的次数。
@@ -1070,13 +1074,15 @@ PREPARE_COMMIT。忽略
 removeUntil清理多余日志记录，清理临时index，释放UNDO阶段的预留页，writeBack把缓存中修改的页回写到硬盘（包括FreeList页）。清空其它数据结构
 
 
-总结：修改的记录只在checkpoint、或者缓存超过阈值才进行刷新，而且undo/redo日志也使用延迟写机制，这些措施都尽可能减小了IO，提高写入性能。但在初始化database的recover中，undo阶段，不判断是否已提交事务，直接写入所有undo日志的page，产生大量不必要的IO。可以通过checkpoint记录活跃事务，从而判断撤销或者重做的记录
+总结：修改的记录只在checkpoint、或者缓存超过阈值才进行刷新，而且undo/redo日志也使用延迟写机制，这些措施都尽可能减小了IO，提高写入性能。与ARIES相比，采用了恢复到checkpoint状态，然后重新redo成功commit的事务，由于add和delete row操作都是幂等的，所以不需要使用LSN保证操作只应用一次，也不需要使用CLR使rollback只执行一次。另外，checkpoint由于限制在没有脏数据的checkpoint，因此不一定是最近的一个checkpoint，因此如果有长事务，recover则可能需要跨越多个checkpoint。
+
 
 
 字节流写入
 ------
 写入byte数组流（目前只有PageLog使用），要利用PageOutputStream写入，类型包括TYPE_STREAM_TRUNK和TYPE_STREAM_DATA
 对于undo日志，recover的时候顺序IO能够提升性能，因此一般分配页面的时候尽可能地分配顺序页面，这可以通过一次过分配多个顺序页面，进行预留操作实现。
+更 重要的是，日志是顺序写入的，在正常事务处理中，能够提高IO性能。
 
 
 *Page页面结构
@@ -1188,7 +1194,7 @@ delete, insert and update使用共享的表锁；
 
 H2实现的是read commited的MVCC，每个Row都有delete位变量，sessionID记录未提交事务的id，还有version避免相同row插入delta，也有保存未提交事务修改导致的差异delta。
 由于是read committed，没有严格考虑事务先后发生顺序，如两个没提交事务，后来的事务可以写入已经被前面事务读取的数据。要实现可序列化，需要使用时间戳实现MVCC。另外H2的MVCC有bug。
-同时该MVCC对于写冲突的行为更加类似悲观锁模式（）
+同时该MVCC对于写冲突的行为是乐观锁模式。
 
 
 Database初始化MVCC=true时
@@ -1202,7 +1208,7 @@ delta是TreeIndex（内存AVL树，AVL树是自平衡二叉搜索树，以发明
 
 注意：这里采用AVL树保存Row数据，而不是类似B+树。Row数据作为键值保存到AVL树结点中。应该是考虑到delta数据量不大，能够放内存，更适合于BST树结构。
 
-AVL树等BST树，是二叉树，每个结点只保存一个键值。适合于数据量较小，可以快速进行查找。
+AVL树等BST树，是二叉树，每个结点只保存一个键值。适合于数据量较小，可以快速进行查找。可以进行balance操作，避免数据倾斜。
 B+树是多叉树，目的是深度尽可能少，查找时减少IO。更适合于大量数据，需要与硬盘IO操作的情况。
 
 
@@ -1213,7 +1219,7 @@ Command.filterConcurrentUpdate()发现更新同一row，等待后重试，超时
 Select默认不加锁，如果已经存在互斥表锁，则需要等待。
 候选index中包括MultiVersionIndex和PageDataIndex。两个Index分别实现了MVCC读写。MultiVersionIndex负责保证能够只读取事务已提交的数据。
 
-Select的关键是对未提交事务的Insert和Delete（Updae实现为Delete old + Insert new）的处理：
+Select的关键是对未提交事务的Insert和Delete（Update实现为Delete old + Insert new）的处理：
 忽略Insert的，选择Delete前的。忽略Insert的可以靠Row的sessionId属性，对于Delete的，需要记录所有未提交事务Delete的row，也就是Delta。但如果同一事务先insert再delete同一row但仍不提交，只记录delete的row到delta是会导致其它事务会select了该row，因此必须add也同时添加到Delta，然后进行先删除后添加的判断（事实上仍然存有bug）。
 
 PageDataIndex扫描查找：
@@ -1347,6 +1353,7 @@ MV_STORE不能和FILE_LOCK=SERIALIZED共用。
 =====================
 **Maps
 1.key lookup
+
 2.fast index lookup
 3.used like database table(key=>primary key, value=>row)/index(key=>index key, value=>primary key)
 
@@ -1413,6 +1420,9 @@ Segment
 
 Entry数据结构主要用于保存key，value值以及链表结构的Prev，Next引用等。
     LIRS的链表是从头部入列元素，尾部出列元素，其实现使用了dummy node的做法：初始化stack/queue为dummy node，该dummy node的Prev作为链表尾部引用，引用尾部元素；Next作为链表头部引用，引用头部元素。初始化空链表时，Prev和Next均指向自己，这样插入和删除元素的时候，就不用显示去修改链表尾部引用和头部引用。
+
+
+注意：由于MVStore采用COW，因此不需要在替换cache的时候刷新回硬盘，只要直接置null即可。
 
 ------
  Put
@@ -1485,9 +1495,9 @@ Database
     --FileStore fileStore
 
 
-
+===========
 file format
--------
+===========
 File Header 1
 File Header 2
 Chunk
@@ -1510,9 +1520,228 @@ Chunk
 -->footer
 
 
-Map:
-MVMap<K, V>
+File Header
+--
+H:2,block:5,blockSize:1000,chunk:d9,created:152cb564ddd,format:1,version:d9,fletcher:21ec9357
+
+H: The entry "H:2" stands for the the H2 database.
+block: The block number where one of the newest chunks starts (but not necessarily the newest).
+blockSize: The block size of the file; currently always hex 1000, which is decimal 4096, to match the disk sector length of modern hard disks.
+chunk: The chunk id, which is normally the same value as the version; however, the chunk id might roll over to 0, while the version doesn't.
+created: The number of milliseconds since 1970 when the file was created.
+format: The file format number. Currently 1.
+version: The version number of the chunk.
+fletcher: The Fletcher-32 checksum of the header.
+
+Chunk
+--
+每个版本一个Chunk。包含Header，Page和footer。Page包含map的数据。一次写完一个Chunk？
+
+Header:
+chunk:d9,block:5,len:1,map:10,max:840,next:4,pages:2,root:364000003658,time:d1b16295,version:d9
+
+Footer:
+chunk:d9,block:5,version:d9,fletcher:c9d0c6e1
+
+chunk: The chunk id.
+block: The first block of the chunk (multiply by the block size to get the position in the file).
+len: The size of the chunk in number of blocks.
+map: The id of the newest map; incremented when a new map is created.
+max: The sum of all maximum page sizes (see page format).
+next: The predicted start block of the next chunk.
+pages: The number of pages in the chunk.
+root: The position of the metadata root page (see page format).
+time: The time the chunk was written, in milliseconds after the file was created.
+version: The version this chunk represents.
+fletcher: The checksum of the footer.
+livePages:
+
+root pos 64bit
+26 bits for the chunk id, 32 bits for the offset within the chunk, 5 bits for the length code, 1 bit for the page type (leaf or internal node).
+chunkId = pos >>> 38
+pageOffset = pos >> 6
+pageMaxLength = ...
+
+getPagePos(int chunkId, int offset, int length, int type)
+
+
+Page:
+length (int): Length of the page in bytes.
+checksum (short): Checksum (chunk id xor offset within the chunk xor page length).
+mapId (variable size int): The id of the map this page belongs to.
+len (variable size int): The number of keys in the page.
+type (byte): The page type (0 for leaf page, 1 for internal node; plus 2 if the keys and values are compressed).
+children (array of long; internal nodes only): The position of the children.
+childCounts (array of variable size long; internal nodes only): The total number of entries for the given child page.
+keys (byte array): All keys, stored depending on the data type.
+values (byte array; leaf pages only): All values, stored depending on the data type.
+
+
+=========
+ MVStore
+=========
+多版本存储引擎。提供MVMap等接口保存数据。
+
+0.元数据
+MVMapConcurrent<String, String> meta           负责记录每个MVMap的元数据。包括id，name，page root的pos，config(name,type还有createVersion，为第一次创建MVMap的时候MVStore.currentVersion的值)
+ConcurrentHashMap<Integer, MVMap<?, ?>> maps   缓存id和对应的MVMap
+
+1.首先根据config进行部分的初始化。
+
+2.然后打开文件，读取文件头初始化元数据:
+readFileHeader()
+--
+读取文件头的时候初始化meta，文件头大致如下：H:2,block:5,blockSize:1000,chunk:d9,created:152cb564ddd,format:1,version:d9,fletcher:21ec9357
+MVStore.readFileHeader()
+1.重复读取两个文件头。每个文件头处理一致：读取文件头到bytebuffer；计算文件头的fletcher32校验和，查看结果值和文件头的fletcher值是否相等；保存属性version为newestVersion，block为chunkBlock，created为creationTime；校验创建时间戳creationTime。
+2.readChunkFooter()读取文件最后的Chunk footer。最后的Chunk的版本应该是最新的，因此当该Chunk的version大于文件头的newestVersion时，newestVersion和chunkBlock更新为该chunk的对应值。
+3.循环读取chunk的header和footer，根据chunk的header.next不断读取下一个chunk，直到最后一个chunk，即lastChunk。
+readChunkHeader()读取chunkBlock*BLOCK_SIZE偏移的Chunk header。readChunkFooter()读取chunk的footer。
+4.设置meta的MVMap的version为lastChunk的version后，调用meta.setRootPos(lastChunk.metaRootPos, -1)，从lastChunk.metaRootPos读取page为meta的root page
+5.查找meta中的"chunk."开头的key，记录的是所有chunk的header。然后把所有的Chunk.id, Chunk键值对存放到ConcurrentHashMap chunks中。
+6.遍历chunks中所有chunk，如果Chunk.pageCountLive为0，调用registerFreePage注册空的Chunk，否则fileStore记录chunk为已用空间。
+--
+
+3.setAutoCommitDelay()初始化后台线程BackgroundWriterThread，该后台线程将会定时进行MVStore的commit操作，即把所有相关的MVMap的内容都刷新到硬盘上
+
+
+MVStore的元数据meta：
+name.NAME -> id     NAME包括表table.id，二级索引index.id，恢复日志undoLog，openTransactions
+map.ID    -> config
+root.ID   -> pos
+chunk.ID  -> chunk信息  保存所有Chunk的Header
+
+
+主要用于对应MVMap的元数据，也就是底层数据的保存（包括SYS表）。
+
+用户表/视图，二级索引等数据库对象需要SYS表保存具体的table的元数据，然后遍历SYS表读取id，objectType, 以及DDL SQL
+
+openMap(name, builder)
+读取meta的内容，根据name获取对应的MVMap，如果不存在，创建MVMap，初始化相关的version，root page。writeVersion初始化为MVStore.currentVersion
+root的Page的version初始化为-1
+
+
 ------
+commit
+------
+Page root在commit之间只有一个writeVersion，期间多次修改只会有一个version的root
+
+BackgroundWriterThread.run()
+MVStore.commitInBackground()
+
+1. MVMap.put()之后，root的Page进行了COW操作，这样会更新root的引用为新Page，该Page的version为writeVersion（就是MVStore进行openMap时的currentVersion）。MVMap的root的Page引用为volatile。这样后台线程就可以看到新的root的Page引用。
+
+2. hasUnsavedChanges()。判断MVStore相关数据是否有修改。
+  首先如果metaChanged为true，即元数据被修改则直接返回true。否则继续遍历所有maps保存的所有MVMap（openMap打开的MVMap都会保存在maps），调用MVMap.getVersion()，也就是root.getVersion()，如果进行了COW操作，root的Version就等于writeVersion，此值>=0 && > lastStoredVersion时则返回true。也就是修改过就会返回true。
+
+3. commitAndSave()。
+  防止commit过程无穷递归，如果currentStoreVersion >= 0则直接返回，否则后面currentStoreVersion = currentVersion。另外还有一些sanity check。
+
+4. storeNow()。把MVMap从上次commit后开始到这次commit时修改的数据flush到硬盘上。
+
+ 0.首先执行一些版本的相关修改：
+  storeVersion = currentVersion    (storeVersion为当前commit的版本)
+  version = ++currentVersion       (version为当前版本currentVersion自增，也就是下次commit的版本)
+  lastStoredVersion 为上次store的版本 = currentVersion - 1;    (lastStoredVersion为上次commit的版本，每次commit后被赋值)
+  lastChunk为最后，也是最新的Chunk块（MVStore初始化中赋值，storeNow最后也会更新为写入的新Chunk）
+
+ 1. 创建新的Chunk，其version值为++currentVersion，其chunkId为从lastChunk递增开始分配，保证不超过最大值Chunk.MAX_ID，并且不与已经存在的Chunk的chunkId重复。
+ 2. 遍历所有关联的MVMap，调用MVMap.setWriteVersion(version)更新到最新版本，注意此时开始，MVMap后续的修改只在下次commit的时候刷新到硬盘。
+    判断哪些是修改过的MVMap。如果MVMap.getCreateVersion() > storeVersion，则表明在store开始后才创建的MVMap，跳过此MVMap。
+    如果MVMap.getVersion() > 0 && >= lastStoredVersion，即表示MVMap的当前root版本是在上次commit到本次commit之间经过COW。注意，store过程中Session线程可能会修改MVMap，MVStore只把当前storeVersion版本的修改写入硬盘。
+    如果此时Session线程对MVMap从上次commit开始的修改还在继续，则需要调用MVMap.waitUntilWritten(storeVersion)等待修改完成。注意这是一个多线程同步，实现其实很简单：MVMap的修改过程中，beforeWrite()会currentWriteVersion = writeVersion和afterWrite()方法currentWriteVersion = -1。这样waitUntilWritten就不断进行while判断currentWriteVersion == storeVersion，则调用Thread.yield()让当前store线程让出控制，进入等待状态。注意这里的writeVersion在之前被赋值下次commit的版本version，因此这里的判断可以保证只会等待当前版本修改完成。
+    完成同步后，则调用MVMap.openVersion(storeVersion)，复制一个readOnly并且root的版本为storeVersion的MVMap，如果此MVMap.getRoot().getPos() == 0，也就是该root还没有被写入硬盘（Page写入硬盘后pos != 0），则添加到数组changed中，稍后写入硬盘。
+
+  3.遍历changed，先把MVMap的root page信息插入meta中，key为root.ID，value为pos，如果Page.getTotalCount() == 0则默认为0（不会写入buffer，所以pos为0），否则为Long.MAX_VALUE(下面写入buffer后，有效pos值覆盖这个)。
+  
+  4.调用applyFreedSpace(storeVersion, time)。把之前需要删除Page的时候，调用registerFreePage注册到freedPageSpace的数据进行检测。如果发现某个Chunk当前版本中maxLenLive为0，也就是没有数据，并且Chunk的创建时间至今已经超过retentionTime，则返回符合要求的Chunk，保存到removedChunks，等待删除。否则更新meta中该chunk的数据。
+
+  5.遍历Changed的MVMap，如果root的getTotalCount() > 0，则表示MVMap有数据，然后调用Page.writeUnsavedRecursive(Chunk, buff)把全部Page的数据按照DFS写入buffer中，写入Buffer后，Page.pos就有值（chunkId, start, pageLength, type合并的long值）。注意如果写入buffer前，pos!=0(已经写入过硬盘)，则不会写入（每个Page只会写入一次）。把这个pos值写入meta中对应key为root.ID的value值。
+
+  6.meta.setWriteVersion(version)更新meta版本为version，即下一次commit的版本。然后把meta的root调用writeUnsavedRecursive写入Buff中。（meta写入到Chunk的最后）
+
+  7.在文件中分配位置写入buffer。reuseSpace默认为true，则调用FileStore.allocate(length)在文件中找寻适合buffer大小的空间，否则reuseSpace为false，则直接写到文件最后。找到的位置为filePos。
+
+  8.调用FileStore.free()释放removedChunks的空间(事实上只是BitSet置空，并没有在文件上进行删除操作)，分配完buffer的写入位置filePos后才释放空间，这样可以避免覆盖旧数据，从而避免写入失败导致数据丢失。
+
+  9.如果reuseSpace为false，即写入的是文件最后，这时调用FileStore.markUsed(end,length)标记空间已经使用。
+
+  10.按照本Chunk的大小，也就是包含block的数量，使用FileStore.allocate进行分配，预测下一个block的filePos，赋值给Chunk.next
+
+  11.把Chunk的Header写入buffer；然后调用revertTemp()释放freedPageSpace相关数据以及对所有MVMap.removeUnusedOldVersions()删除旧版本的root（采用复制list来避免加锁同步，但考虑到commit和put可并发，由于commit期间只有一个version，root会缓存，因此同步正确）；最后写入Chunk的footer到buffer。
+
+  12.FileStore.writeFully()把buffer写到filePos的起始位置。
+
+  13.根据需要判断是否重写FileHeader。
+
+  14.如果写入的buffer不是在文件最后，则shrinkFileIfPossible()，收缩文件大小（由于之前删除过removedChunks）
+
+  15.遍历changed的MVMap，调用MVMap.writeEnd()，清空MVMap所有缓存的childrenPages引用（已经写入硬盘，Page.getPos() != 0）。调用metaRoot.writeEnd()。这样下次读取需要从硬盘重新读取子Page。相当于清理Page的cache数据。
+
+  16.更新unsavedPageCount，metaChanged，lastStoredVersion变量。
+
+freedPageSpace记录maxLenLive，pageCountLive
+
+------
+rollback
+------
+rollbackTo(version)
+
+1.如果version == 0，则清空meta，chunks，maps，freedPageSpace的数据，并且清空文件内容。
+
+2.遍历maps，调用MVMap.rollbackTo(version)，迭代MVMap.oldRoots，把大于等于version的Page删掉。
+
+3.删除freedPageSpace里从currentVersion到version的数据
+
+4.meta.rollbackTo(version)，回滚meta
+
+5.从lastChunk开始，递减ChunkId，找出第一个Chunk.version小于version的Chunk removeChunksNewerThan （commit的时候，Chunk分配是循环递增id的，见步骤1）
+
+6.如果找到removeChunksNewerThan，则从lastChunk开始递减id到removeChunksNewerThan，清理这些Chunk（写入0覆盖文件）。然后重新写文件头，读取新文件头
+
+7.然后遍历maps，如果MVMap的创建版本getCreateVersion() >= version，则删除MVMap，否则如果之前的步骤清理过Chunk，则重新读取meta的root数据，从硬盘读取对应的root数据
+
+8.更新lastChunk.id - 1的ChunkId的信息到meta。（可能会被回滚了？）
+
+9.更新currentVersion，setWriteVersion(version)更新meta和所有MVMap的version。
+
+------
+compact
+------
+compact(int targetFillRate, int minSaving)
+0.首先判断compact后是否满足目标填充率targetFillRate, 以及最小节省Page数量minSaving。
+fillRate = (int) (100 * maxLengthLiveSum / maxLengthSum)，如果fillRate已经>=targetFillRate，则直接返回。
+minSaving为所有old trunk（创建时间到当前时间超出了保存时间retain（默认为45s）），所有非活跃Page的数量，如果<minSaving，则直接返回。
+找出所有要清理的Chunk保存到old。
+
+1.遍历old，分别调用copyLive()。
+copyLive首先重新遍历Chunk的所有Page，每个Page重新找回对应的MVMap，然后遍历Page的所有key，如果MVMap从key找回的Page存在old中，则删除该key后再重新插入，这样就等于把该Page创建当前版本的copy。
+
+2.最后调用commitAndSave()。重新写入新的trunk，并且删除旧的空Chunk。
+
+
+------
+open old version
+------
+MVMap.openVersion(long version)
+
+如果version比root（MVMap保存的最新版本的B+树的root）要大，则创建readOnly的MVMap m，并设置m.root = root;
+否则二分法查找oldRoots保存的旧版本的root，找到指定root则返回readOnly的MVMap为该root，找不到root，则调用MVStore.openMapVersion(long version, int mapId, MVMap<?, ?> template)查找，该方法首先从硬盘读取旧版本version的meta数据oldMeta，然后从oldMeta中读取mapId指定的rootPos，最后创建readOnly的MVMap，并设置rootPos和version为旧版本的数据。
+
+
+
+注意：
+1.没有recover，即没有undo/redo。因为缓冲是No steal,Force策略
+2.每个chunk在commit的时候只有两次写的操作：一次是新的chunk写入文件，一次是文件头的更改，令其指向新的chunk。
+
+3.要注意防止文件碎片化和压缩处理等。
+
+
+Map:
+===========
+MVMap<K, V>
+===========
+
 volatile Page root;                         
 volatile long writeVersion;                 version used for writing
 volatile long currentWriteVersion = -1;     version is set during a write operation
@@ -1549,89 +1778,56 @@ put() {
 }
 
 put方法:
-首先检查是否有并发修改（检查并发修改版本是否为-1，然后设置为当前写版本），如果有则抛出异常。
-然后比较root的当前version是否为当前的writeVersion，如果不是则shallow copy新的page作为新root。
-如果root超出大小限制，则split为两个兄弟page，并且新建一个root，作为它们的parent。
-然后从root开始递归向leaf插入value，如果超出大小限制，则split。  put(Page p, long writeVersion, Object key, Object value)
-设置新的root。（removeUnusedOldVersions, etc...）
-设置并发修改版本为-1
+0.首先检查是否有并发修改（检查并发修改版本是否为-1，然后设置为当前写版本），如果有则抛出异常。
+1.然后比较root的当前version是否为当前的writeVersion，如果不是则shallow copy新的page作为新root。MVStore的每次commit都会使writeVersion + 1。
+2.如果root超出大小限制，则split为两个兄弟page，并且新建一个root，作为它们的parent。
+3.然后从root开始递归向leaf插入value，如果超出大小限制，则split。递归过程中，只要遇到node/leaf，如果不是和当前writeVersion相等，都会进行copy。这样会尽可能地把Page从old chunk移动到当前version的chunk（commit的时候写入）。
+4.设置新的root。（removeUnusedOldVersions, etc...）
+5.设置并发修改版本为-1
+
+注意：
+关于第3点，在copyOnWrite时，只要找到node，则直接Copy，事实上，put的时候可能只会对leaf结点有影响，node结点只要不split就没有变化，这样做可以在commit的时候把尽可能多的旧page写到commit的Chunk中，这样就
+
 
 
 get(key)方法就是从root开始二分查找B+树。
 
 
+===============
 MVMapConcurrent
-------
+===============
 
+==========
 MVRTreeMap
-------
-
-
-MVStore
------
-多版本存储引擎。提供MVMap等接口保存数据。
-
-1.元数据
-MVMapConcurrent<String, String> meta           负责记录每个MVMap的元数据。包括id，name，page root的pos，config(name,type还有createVersion，为第一次创建MVMap的时候MVStore.currentVersion的值)
-ConcurrentHashMap<Integer, MVMap<?, ?>> maps   缓存id和对应的MVMap
-
-读取文件头的时候初始化meta，文件头大致如下：H:2,block:5,blockSize:1000,chunk:d9,created:152cb564ddd,format:1,version:d9,fletcher:21ec9357
-MVStore.readFileHeader()
-1.重复读取两个文件头。每个文件头处理一致：读取文件头到bytebuffer；计算文件头的fletcher32校验和，查看结果值和文件头的fletcher值是否相等；保存属性version为newestVersion，block为chunkBlock，created为creationTime；校验创建时间戳creationTime。
-
-2.readChunkFooter()读取文件最后的Chunk footer。如果该Chunk的version大于文件头的newestVersion，则newestVersion和chunkBlock更新为该chunk的对应值。
-
-3.readChunkHeader()读取chunkBlock*BLOCK_SIZE偏移的Chunk header。
-
-
-
-openMap(name, builder)
-根据name获取对应的MVMap，如果不存在，创建新的MVMap，初始化相关的version。
+==========
 
 
 
 
-
-
-MVStore.commit() {
-    //persistent store，
-    if (fileStore != null) {
-        // TODO
-        return commitAndSave();
-    }
-
-    //memory store，则增加当前版本，并且把该MVStore保存的MVMap都设置为该版本。
-    long v = ++currentVersion;
-    setWriteVersion(v);
-    return v;
-}
-
-
-
-
-compact()
-
-
-
-
-Page
-------
+======
+ Page
+======
 Page是MVMap的B+树结构对象。可以作为node和leaf结点。
 
 Page
 --MVMap map
---long version
+--long version            记录当前的version
 --int keyCount
 --Object[] keys
 --Object[] values
 --int childCount          node专用
 --long[] children         node专用，记录Page的pos，MVStore.readPage()
 --Page[] childrenPages    node专用，记录Page对象
+--long pos                存储pos，如果已经存储硬盘，则不为0。
+
+
 
 Page.binarySearch(Object key)，标准的Binary Search实现，其中返回-(low + 1)表示要插入的位置为low，查找完成后记录本次查找的结果cachedCompare，这样下次开始查找的位置从cachedCompare开始，如果和上次查找一样，则可以马上结束查找。
 
 Page的insert采用递归式从上至下的insert node方式，首先判断插入的结点是否超过限制，是则首先split，然后插入对应的子结点，然后重新从该父结点开始，递归继续insert node。
 缺点：需要多次binary search。。。
+这样做的目的应该是希望尽可能地更新结点的version，等下次commit的时候写入新的chunk。这样旧的chunk没有数据时，就可以重复利用旧空间。
+
 
 
 Page的B+树结构和PageBtreeLeaf/PageDataLeaf大致相同。
@@ -1639,9 +1835,27 @@ Node结点时，keys[i]的值为childrenPages[i]和children[i]所指的childrenP
 leaf结点之间同样没有链接，要遍历下一个叶子结点，必须递归查询父node结点，获取兄弟叶子结点。
 
 
+Page.copy()  使用的是Copy on Write的模式，只有当真正修改数组元素时，才进行复制对应的数组。
+0.创建新的Page对象，这是一个shallow copy对象，所有的数组都具有相同的引用。
+1.removePage()。实际上是往MVStore注册当前version的对应Chunk的maxLenLive和pageCountLive减去相应的值。另外，如果是meta在commit过程中的修改，则为上一个版本的注册。
 
-MVTable
-------
+
+=======
+总结
+=======
+PageStore是传统的存储系统，提供了数据流式存储日志，以及随机B+树块写入操作。steal, No force的缓存策略（可以控制是否commit的时候flush日志，定时刷新日志。同时为了提高性能，只在checkpoint阶段执行writeback写入B+树数据块，不会定时写入）。对于并发控制采用简单的读写锁，也有MVCC和乐观并发控制作为并发控制的另外选择（不过有bug）。
+
+MVStore是采用了Log structured storage的新型存储系统，主要优点是采用版本控制读写，commit的时候把所有的数据块变为顺序写入新的chunk，采用No steal, force的缓存策略。另外，默认采用了MVCC以及乐观并发控制的并发控制方法。
+
+
+
+==========================================================
+              DB相关
+==========================================================
+
+=========
+ MVTable
+=========
 
   包含MVPrimaryIndex，MVDelegateIndex，MVSecondaryIndex三种类型的index。MVPrimaryIndex专门用于scan，MVDelegateIndex封装了MVPrimaryIndex，专门用于primary index，MVSecondaryIndex专门用于二级索引。
   同样是首先初始化MVPrimaryIndex，默认的mainIndexColumn为-1，也就是使用内在的key，然后添加到indexes。接着meta表如果存在用户定义的primary index，则判断如果该index定义符合条件（单列，并且类型是long,int,short,byte，并且是ASC排序），则设置mainIndexColumn为该列。并且此时就会创建MVDelegateIndex添加到indexes，专门用于primary index查询。（MVPrimaryIndex只能用于scan）
@@ -1652,21 +1866,21 @@ mapName = "table." + getId();
 //dataMap就包含了MVTable的数据。
 dataMap = mvTable.getTransaction(null).openMap(mapName, keyType, valueType);
 
-
-MVPrimaryIndex
-------
+================
+ MVPrimaryIndex
+================
 TransactionMap dataMap的map key就是row key。map value存放的都是整个row。
 getCost()和PageDataIndex.getCost()实现一致。10 * (rowCount + Constants.COST_ROW_OFFSET);
 
 
-
-MVDelegateIndex
-------
+=================
+ MVDelegateIndex
+=================
 和PageDelegateIndex作用类似，作为以primary key为索引进行select的index。简单封装MVPrimaryIndex，getCost(), find()都和PageDelegateIndex的实现一致。
 
-
-MVSecondaryIndex
-------
+==================
+ MVSecondaryIndex
+==================
 TransactionMap dataMap的map key中除了index columns外，还包括row key。这样可以保证key和value唯一对应。因此map key的列数量keyColumns为索引列数量+1。map value存放的都为ValueNull对象的单例。这样在每次构造map key的时候就把row key添加到最后。
 
 getCost的实现和MVDelegateIndex一致。
@@ -1678,6 +1892,123 @@ bigger = true，没有采用一次二分查找，而是offset * 2后再/2的方�
 
 类比PageBtree.find(SearchRow compare, boolean bigger, boolean add, boolean compareKeys) 通过控制bigger查找刚好少于等于或大于compare的索引。使用一次二分查找即可。
 
+
+========================
+      Transaction
+========================
+TransactionStore
+--MVMap<Long, Object[]> undoLog;            //undo日志记录 Key: {opId}, value: {mapId, key, oldValue}
+--MVStore store
+
+
+TransactionStore.Transaction [static class]  //每个Session对象有当前的一个Transaction对象
+--TransactionStore store
+--int transactionId                         //transactionId表示当前事务ID。由TransactionStore保证唯一。
+--long logId                                //TransactionStore.undoLog里记录的最后日志ID。 初始化时为0。Transaction.log()/rollbackToSavepoint()等会修改logId.
+初始化：Session.getTransaction()初始化Transaction对象。
+
+
+
+TransactionMap<K, V>   //组合了MVMap以及Transaction对象，封装为具有事务特性的MVMap。
+--int mapId
+--long readLogId                  //TransactionMap读值时默认logId。当前事务更新不会立即可见，支持语句处理操作，如update test set id = id + 1。目前都为Long.MAX_VALUE
+--MVMap<K, VersionedValue> map    //写最新数据的存储map   Key: rowKey, Value: VersionedValue
+--Transaction transaction         //当前关联的Transaction对象。
+
+
+
+           TransactionStore
+        ^                   ^
+        |                   |
+Transaction（Session）    Transaction（Session）  ...   (每个Session有单个Transaction引用TransactionStore)
+        ^
+        |
+TransactionMap(MVPrimaryIndex.datamap.map/mapId)  ... (MVPrimaryIndex.dataMap会负责创建属于该Session的TransactionMap，作为提供给该Session的接口查询数据)
+
+
+
+MVPrimaryIndex -> dataMap(TransactionMap  -> Transaction = null)
+
+
+==========
+  commit
+==========
+Session.commit()
+Session.commit开始，和PageStore相比，由于不会写Session的undoLog，undo日志的commit由Transaction和TransactionStore负责。
+1.遍历获得共享锁的表locks，分别调用这些表的MVTable.commit()，(MVTable.commit只是增加database的modificationDataId。select的lastResult缓存相关）
+2.Transaction.commit() -> TransactionStore.commit()
+  通过从0开始递增到Transaction的logId，和TransactionId组合为operationId，这样就可以获得所有未提交修改对应的undo日志的key。通过TransactionStore.undoLog，找出该事务的所有undo日志，注意如果logId返回的undo日志为空，则可能因为在之前commit过程中删除了部分undo日志，但没有完成commit却发生了crash，因此重新找到下一条该事务提交的undo日志，继续上次没有完成的commit。
+  日志包含三个对象{mapId, rowKey, oldValue}，commit过程只需要利用mapId从TransactionStore.maps中找出undo记录对应的MVMap，然后从该map中根据rowKey找出未提交数据VersionedValue value，如果value为null，表示在之前的undo记录删除，因此忽略（如先insert后delete）；如果value.value为null，也就是当前事务删除值，则调用map.remove(key)删除该记录；如果value.value有值，则重新创建operationId为0，value相同的VersionedValue，map.put(key, value)插入即可。
+  顺利完成该undo日志的处理后，undoLog.remove(key)删除该undo日志的记录
+
+3.TransactionStore.endTransaction()
+当前没有已经begin并且修改了数据的事务（undoLog为空），并且MVStore中存在太多脏page数（> 3/4最大值，最大值=19kb / pageSplitSize页面split大小）则调用MVStore.commit()刷新记录。
+
+
+------
+BackgroundWriterThread.run() -> MVStore.commitInBackground()
+除了事务显示commit外，MVStore有后台线程定时commit，刷新数据到硬盘。注意这是个多线程刷新，刷新的时候可能还在修改MVMap的数据。
+
+
+
+
+==========
+ rollback
+==========
+Session.rollback()
+同样，不会写Session的undoLog，rollback由TransactionStore负责。
+Session.rollbackTo()
+1.利用Iterator遍历，日志id从Transaction.logId逐渐减小到savepointId（如果全部rollback，则为0），同样和TransactionId组成operationId，通过TransactionStore.undoLog找出要rollback的所有undo日志。对于每条undo日志，根据mapId找到对应的MVMap，然后把mapName，rowKey，oldValue封装Change对象返回。mapName是通过mapId向MVStore.meta元数据查找出的名字。
+2.根据mapName找出对应的MVTable。由于MVPrimaryIndex的MVMap的mapName是table.xx，MVSecondaryIndex的mapName是index.xx。所以只对MVPrimaryIndex的undo日志执行rollback操作，通过构造UndoLogRecord重新调用MVTable进行remove/put操作。注意，此过程中会重新产生undo日志。另外此过程并没有删除undo日志。
+3.Transaction.commit()
+重新commit在rollback过程中产生undo日志。
+
+
+TransactionStore.rollbackTo()
+与Session.rollbackTo类似，但会在完成undo操作后，直接删除undo日志，比前者要方便简单。另外就算在该过程crash，也不会出现问题，因为每个步骤都是可逆的。
+
+
+
+总结：
+要注意区分commit和rollback：
+1.commit在redo过程中会删除undo日志，rollback并不会删除任何undo日志，相反还会写入新的undo日志，直到完全rollback完成后再次commit才会删除undo日志。
+2.rollback删除undo日志是从最大的logId开始到0的，commit是从0开始到最大的logId
+3.commit和rollback都必须先执行操作后删除undo日志
+4.Session.rollback先undo所有更改后再commit删除所有undo日志。TransactionStore.rollbackTo则在undo一个操作后，马上删除对应undo日志。两者过程中遇到crash都可以recover。相比较，insert和delete都是先写undo日志，然后再更新数据。
+
+
+
+savepoint x1;
+ROLLBACK TO SAVEPOINT x1;
+
+
+
+==========
+ Recover
+==========
+MVStore负责recover相关。
+1.undo日志是TransactionStore.undoLog，MVMap负责保存。
+2.MVTable表的索引MVPrimaryIndex和MVSecondaryIndex的数据组织内部同样也是由MVMap保存。
+因此只需要MVStore负责恢复MVMap即可。事实上，由于MVStore后台线程会定期commit，MVStore把符合要求MVMap的Page刷新到硬盘上，包括undo日志以及未提交的修改数据。所以当数据库crash重启后，会出现未提交数据在MVMap中，此时就需要利用undo日志进行recover操作。
+
+transaction状态：
+STATUS_CLOSED     = 0       a closed transaction (committed or rolled back)                    commit()/rollback()完成后设置。
+STATUS_OPEN       = 1       an opened but not commit or roll back yet transaction.             初始化时设置
+STATUS_PREPARED   = 2       a prepared transaction                                             2pc相关
+STATUS_COMMITTING = 3       being committed, but possibly not yet finished (Store is closed)   commit()中设置
+
+
+recover操作
+MVTableEngine.Store.initTransactions()
+调用TransactionStore.getOpenTransactions()恢复在关闭前，还没开始commit或需要rollback的（STATUS_OPEN）或者已经开始但没有完成commit（STATUS_COMMITTING）的各个transaction的状态。然后这些transaction的状态为STATUS_OPEN的需要rollback，STATUS_COMMITTING的需要commit。
+
+注意此时的rollback，执行的是Transaction.rollback()，会执行日志删除！
+
+====
+总结
+====
+1.MVStore的recover步骤，对于非STATUS_COMMITTING状态的事务（还没开始commit）都会进行undo操作。
+2.MVStore认定只有Transaction至少logId >= 0的undo日志被删除，这样Transaction才算处于STATUS_COMMITTING，如果发生crash，recover步骤就会redo这些事务。rollback则只有当rollback操作完成后，后续执行的Transaction.commit()才开始删除undo日志。
 
 
 =====================
@@ -1774,12 +2105,15 @@ Cursor直接遍历MVMap底层的B+树，因此符合前缀索引的选择逻辑�
 =====================
 insert into test values(5, 'aaa')
 
+不同事务：
+Insert same row？     由于获取的VersionedValue为未提交事务写入，抛出ERROR_TRANSACTION_LOCKED异常
+Inserted and delete？ Inserted无法被select
+Inserted and update？ Inserted无法被select
 
-TransactionStore.TransactionMap<K, V>   //组合了MVMap以及Transaction对象，封装为具有事务特性的MVMap。
---int mapId
---long readLogId                  //TransactionMap读值时默认logId。当前事务更新不会立即可见，支持语句处理操作，如update test set id = id + 1。目前都为Long.MAX_VALUE
---MVMap<K, VersionedValue> map    //写最新数据的存储map   Key: rowKey, Value: VersionedValue
---Transaction transaction         //当前关联的Transaction对象。
+
+同一事务：
+Insert same row？  MVPrimaryIndex.add()抛出DUPLICATE_KEY_1异常
+
 
 
 TransactionStore.VersionedValue    //operationId和对应value的封装对象
@@ -1821,7 +2155,7 @@ m.setSavepoint(Long.MAX_VALUE));
 获取当前Session对应的TransactionMap，并设置savePoint，即readLogId最大。（所有的更新都可被当前事务可见）
 注意该TransactionMap底层的数据存储MVMap与MVPrimaryIndex.dataMap一致，也就是MVTable底层的存储。
 
-3.Value old = map.getLatest(key); (get(key, Long.MAX_VALUE);) 获取要插入rowKey的最新value，如果不为null，则抛出DUPLICATE_KEY_1异常。为nullL则接着执行。
+3.Value old = map.getLatest(key); (get(key, Long.MAX_VALUE);) 获取要插入rowKey的最新value，如果不为null，则抛出DUPLICATE_KEY_1异常。为null则接着执行。
 4.map.put(key, ValueArray.get(row.getValueList()));             (下面接着)
 插入row到Session对应的TransactionMap中。
 5.lastKey = Math.max(lastKey, row.getKey());
@@ -1870,20 +2204,6 @@ update test set id = id + 1?
 细节：replace()方法同样为synchronized，首先查看map中对应key的值是否和current相等，如果相等才修改对应值，否则返回false。
 
 
-           TransactionStore
-        ^                   ^
-        |                   |
-Transaction（Session）    Transaction（Session）  ...   (每个Session有单个Transaction引用TransactionStore)
-        ^
-        |
-TransactionMap(MVPrimaryIndex.datamap.map/mapId)  ... (MVPrimaryIndex.dataMap会负责创建属于该Session的TransactionMap，作为提供给该Session的接口查询数据)
-
-
-
-
-MVPrimaryIndex -> dataMap(TransactionMap  -> Transaction = null)
-
-
 *MVSecondaryIndex.add()
 ------
 MVSecondaryIndex的插入逻辑与MVPrimaryIndex类似。但也有部分注意的地方。
@@ -1902,6 +2222,14 @@ undo日志记录的是之前的值，是ValueNull
       Delete
 =====================
 delete from test where id = 4
+
+Delete same row？     Delete是设置为null，后面的事务接着Delete时会因为存在没提交数据而失败
+Deleted and insert？  会因为select出原来的key，导致primary key冲突。
+Deleted and update？  与Delete same row一样，抛出异常
+
+同一事务：
+Delete same row?    找不到row，忽略
+
 
 
 Delete.update()
@@ -1925,7 +2253,7 @@ undo日志记录的是之前的值，也就是ValueNull
 
 
 *****
-MVPrimaryIndex.remove(Session session, Row row/)
+MVPrimaryIndex.remove(Session session, Row row)
 getMap()获取TransactionMap，TransactionMap.remove(key)删除row。
 
 VersionedValue.value变化：
@@ -1938,6 +2266,14 @@ undo日志记录的是之前的值，也就是ValueArray
 =====================
 同样是先delete后insert。
 
+Update same row？    第二次Update的时候由于存在没提交数据的null，因此失败
+updated and delete？ 同样是存在没提交数据的null，因此失败
+updated and insert？ Insert same row一样，primary key冲突
+
+同一事务：
+update same row?    成功
+
+
 MVPrimaryIndex.dataMap.map包括有两个entry，一个是update前的key1，对应的value为null，另外一个是update后的key2，对应的value为更新row。
 
 
@@ -1948,152 +2284,29 @@ v1 int,
 FOREIGN KEY(id1) REFERENCES (id)
 )
 
-========================
-      Transaction
-========================
 
-TransactionStore.Transaction [static class]  //每个Session对象有当前的一个Transaction对象
---TransactionStore store
---int transactionId                         //transactionId表示当前事务ID。由TransactionStore保证唯一。
---long logId                                //TransactionStore.undoLog里记录的最后日志ID。 初始化时为0。Transaction.log()/rollbackToSavepoint()等会修改logId.
-初始化：Session.getTransaction()初始化Transaction对象。
-
-
-TransactionStore
---MVMap<Long, Object[]> undoLog;            //undo日志记录 Key: {opId}, value: {mapId, key, oldValue}
---MVStore store
-
-==========
-  commit
-==========
-Session.commit()
-Session.commit开始，和PageStore相比，由于不会写Session的undoLog，undo日志的commit由Transaction和TransactionStore负责。
-1.遍历获得共享锁的表locks，分别调用这些表的MVTable.commit()，(MVTable.commit只是增加database的modificationDataId。select的lastResult缓存相关）
-2.Transaction.commit() -> TransactionStore.commit()
-  通过从0开始递增到Transaction的logId，和TransactionId组合为operationId，这样就可以获得所有未提交修改对应的undo日志的key。通过TransactionStore.undoLog，找出该事务的所有undo日志，注意如果logId返回的undo日志为空，则可能因为在之前commit过程中删除了部分undo日志，但没有完成commit却发生了crash，因此重新找到下一条该事务提交的undo日志，继续上次没有完成的commit。
-  日志包含三个对象{mapId, rowKey, oldValue}，commit过程只需要利用mapId从TransactionStore.maps中找出undo记录对应的MVMap，然后从该map中根据rowKey找出未提交数据VersionedValue value，如果value为null，表示在之前的undo记录删除，因此忽略（如先insert后delete）；如果value.value为null，也就是当前事务删除值，则调用map.remove(key)删除该记录；如果value.value有值，则重新创建operationId为0，value相同的VersionedValue，map.put(key, value)插入即可。
-  顺利完成该undo日志的处理后，undoLog.remove(key)删除该undo日志的记录
-
-3.TransactionStore.endTransaction()
-当前没有已经begin并且修改了数据的事务（undoLog为空），并且MVStore中存在太多脏page数（> 3/4最大值，最大值=19kb / pageSplitSize页面split大小）则调用MVStore.commit()刷新记录。
-
-
-------
-BackgroundWriterThread.run() -> MVStore.commitInBackground()
-除了事务显示commit外，MVStore有后台线程定时commit，刷新数据到硬盘。注意这是个多线程刷新，刷新的时候可能还在修改MVMap的数据。
+=======
+总结
+=======
+1.以MVStore为存储引擎，实现了事务性的存储模块TransactionStore，并发控制的策略是MVCC(MV_STORE=TRUE的时候，默认设置Database.multiVersion=true) + 乐观并发控制
+2.利用MVMap保存undo日志，以及在索引的MVMap中保存没提交的数据（可以当redo日志使用，delete的没有提交要设置为null占位）
+3.使用steal,no-force缓存策略，recover的时候需要根据事务是否提交进行redo和undo（与ARIES不同的策略）
 
 
 
 
-==========
- rollback
-==========
-Session.rollback()
-同样，不会写Session的undoLog，rollback由TransactionStore负责。
-Session.rollbackTo()
-1.利用Iterator遍历，日志id从Transaction.logId逐渐减小到savepointId（如果全部rollback，则为0），同样和TransactionId组成operationId，通过TransactionStore.undoLog找出要rollback的所有undo日志。对于每条undo日志，根据mapId找到对应的MVMap，然后把mapName，rowKey，oldValue封装Change对象返回。mapName是通过mapId向MVStore.meta元数据查找出的名字。
-2.根据mapName找出对应的MVTable。由于MVPrimaryIndex的MVMap的mapName是table.xx，MVSecondaryIndex的mapName是index.xx。所以只对MVPrimaryIndex的undo日志执行rollback操作，通过构造UndoLogRecord重新调用MVTable进行remove/put操作。注意，此过程中会重新产生undo日志。另外此过程并没有删除undo日志。
-3.Transaction.commit()
-重新commit在rollback过程中产生undo日志。
+============================
+语法特性：
 
+Create temp[GLOBAL TEMPORARY] table
 
-TransactionStore.rollbackTo()
-与Session.rollbackTo类似，但会在完成undo操作后，直接删除undo日志，比前者要方便简单。另外就算在该过程crash，也不会出现问题，因为每个步骤都是可逆的。
-
-
-
-总结：
-要注意区分commit和rollback：
-1.commit在redo过程中会删除undo日志，rollback并不会删除任何undo日志，相反还会写入新的undo日志，直到完全rollback完成后再次commit才会删除undo日志。
-2.rollback删除undo日志是从最大的logId开始到0的，commit是从0开始到最大的logId
-3.commit和rollback都必须先执行操作后删除undo日志
-4.Session.rollback先undo所有更改后再commit删除所有undo日志。TransactionStore.rollbackTo则在undo一个操作后，马上删除对应undo日志。两者过程中遇到crash都可以recover。相比较，insert和delete都是先写undo日志，然后再更新数据。
-
-
-
-savepoint x1;
-ROLLBACK TO SAVEPOINT x1;
-
-
-
-==========
- Recover
-==========
-MVStore负责recover相关。
-1.undo日志是TransactionStore.undoLog，MVMap负责保存。
-2.MVTable表的索引MVPrimaryIndex和MVSecondaryIndex的数据组织内部同样也是由MVMap保存。
-因此只需要MVStore负责恢复MVMap即可。事实上，由于MVStore后台线程会定期commit，MVStore把符合要求MVMap的Page刷新到硬盘上，包括undo日志以及未提交的修改数据。所以当数据库crash重启后，会出现未提交数据在MVMap中，此时就需要利用undo日志进行recover操作。
-
-transaction状态：
-STATUS_CLOSED     = 0       a closed transaction (committed or rolled back)                    commit()/rollback()完成后设置。
-STATUS_OPEN       = 1       an opened but not commit or roll back yet transaction.             初始化时设置
-STATUS_PREPARED   = 2       a prepared transaction                                             2pc相关
-STATUS_COMMITTING = 3       being committed, but possibly not yet finished (Store is closed)   commit()中设置
-
-
-recover操作
-MVTableEngine.Store.initTransactions()
-调用TransactionStore.getOpenTransactions()恢复在关闭前，还没开始commit或需要rollback的（STATUS_OPEN）或者已经开始但没有完成commit（STATUS_COMMITTING）的各个transaction的状态。然后这些transaction的状态为STATUS_OPEN的需要rollback，STATUS_COMMITTING的需要commit。
-
-注意此时的rollback，执行的是Transaction.rollback()，会执行日志删除！
-
-总结：
-1.MVStore的recover步骤，对于非STATUS_COMMITTING状态的事务（还没开始commit）都会进行undo操作。
-2.MVStore认定只有Transaction至少logId >= 0的undo日志被删除，这样Transaction才算处于STATUS_COMMITTING，如果发生crash，recover步骤就会redo这些事务。rollback则只有当rollback操作完成后，后续执行的Transaction.commit()才开始删除undo日志。
-
-
-https://groups.google.com/forum/#!forum/h2-database
-
-
-
-
-
-总结：
-PageStore是传统的物理undo/逻辑redo日志，checkpoint的时候进行提交数据的writeback以及已提交事务对应的undo日志删除对比，另外后台线程刷新undo/redo日志的时候会进行synchronized，从而会影响到修改数据的事务。
-MVStore的事务恢复机制，与
-
-
-
-
-TODO
-多线程的更新。
-MVMap.waitUntilWritten()
-
-
-
-
-
-==========
-Select
-==========
-
-
-
-
-
-==========
-Insert
-==========
-不同事务：
-Insert same row？     由于获取的VersionedValue为未提交事务写入，抛出ERROR_TRANSACTION_LOCKED异常
-Inserted and delete？ Inserted无法被select
-Inserted and update？ Inserted无法被select
-
-
-同一事务：
-Insert same row？  MVPrimaryIndex.add()抛出DUPLICATE_KEY_1异常
-
-
-
-
-
-==========
-Delete
-==========
-
+Temporary tables are deleted when closing or opening a database. Temporary tables can be global (accessible by all connections) or local (only accessible by the current connection). The default for temporary tables is global. Indexes of temporary tables are kept fully in main memory, unless the temporary table is created using CREATE CACHED TABLE.
 
 
 TODO:
+
+
+compact
 
 FOR UPDATE
 
@@ -2112,6 +2325,8 @@ close database...Database.closeOpenFilesAndUnlock()
 
 //TCP server
 // memtable
+
+
 
 
 

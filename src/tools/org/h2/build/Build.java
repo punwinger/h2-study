@@ -196,6 +196,7 @@ public class Build extends BuildBase {
                 File.pathSeparator + "ext/org.osgi.core-4.2.0.jar" +
                 File.pathSeparator + "ext/org.osgi.enterprise-4.2.0.jar" +
                 File.pathSeparator + "ext/jts-1.13.jar" +
+                File.pathSeparator + "ext/junit-4.11.jar" +
                 File.pathSeparator + System.getProperty("java.home") + "/../lib/tools.jar";
         FileList files;
         if (clientOnly) {
@@ -255,7 +256,7 @@ public class Build extends BuildBase {
         copy("docs", files("src/docsrc/index.html"), "src/docsrc");
         java("org.h2.build.doc.XMLChecker", null);
         java("org.h2.build.code.CheckJavadoc", null);
-        java("org.h2.build.code.CheckTextFiles", null);
+        //java("org.h2.build.code.CheckTextFiles", null);
         java("org.h2.build.doc.GenerateDoc", null);
         java("org.h2.build.doc.GenerateHelp", null);
         java("org.h2.build.i18n.PrepareTranslation", null);
@@ -264,8 +265,8 @@ public class Build extends BuildBase {
         java("org.h2.build.doc.WebSite", null);
         java("org.h2.build.doc.LinkChecker", null);
         java("org.h2.build.doc.XMLChecker", null);
-        java("org.h2.build.doc.SpellChecker", null);
-        java("org.h2.build.code.CheckTextFiles", null);
+        //java("org.h2.build.doc.SpellChecker", null);
+        //java("org.h2.build.code.CheckTextFiles", null);
         beep();
     }
 
@@ -413,6 +414,31 @@ public class Build extends BuildBase {
             exclude("*.bat").
             exclude("*.sh").
             exclude("*.txt");
+        jar("bin/h2" + getJarSuffix(), files, "temp");
+        filter("src/installer/h2.sh", "bin/h2.sh", "h2.jar", "h2" + getJarSuffix());
+        filter("src/installer/h2.bat", "bin/h2.bat", "h2.jar", "h2" + getJarSuffix());
+        filter("src/installer/h2w.bat", "bin/h2w.bat", "h2.jar", "h2" + getJarSuffix());
+    }
+
+    public void jarWithTest() {
+        compile();
+        manifest("H2 Database Engine", "org.h2.tools.Console");
+        FileList files = files("temp").
+                exclude("temp/android/*").
+                exclude("temp/org/h2/android/*").
+                exclude("temp/org/h2/build/*").
+                exclude("temp/org/h2/dev/*").
+                exclude("temp/org/h2/jcr/*").
+                exclude("temp/org/h2/jaqu/*").
+                exclude("temp/org/h2/java/*").
+                exclude("temp/org/h2/jcr/*").
+                exclude("temp/org/h2/mode/*").
+                exclude("temp/org/h2/samples/*").
+                exclude("temp/org/h2/server/ftp/*").
+                //           exclude("temp/org/h2/test/*").
+                        exclude("*.bat").
+                exclude("*.sh").
+                exclude("*.txt");
         jar("bin/h2" + getJarSuffix(), files, "temp");
         filter("src/installer/h2.sh", "bin/h2.sh", "h2.jar", "h2" + getJarSuffix());
         filter("src/installer/h2.bat", "bin/h2.bat", "h2.jar", "h2" + getJarSuffix());

@@ -24,6 +24,9 @@ public class WriteBuffer {
 
     private ByteBuffer buff = reuse;
 
+    private byte[] byteBuffer = new byte[3 * MIN_GROW];
+    private char[] charBuffer = new char[MIN_GROW];
+
     /**
      * Write a variable size integer.
      *
@@ -54,20 +57,50 @@ public class WriteBuffer {
      * @return this
      */
     public WriteBuffer putStringData(String s, int len) {
-        ByteBuffer b = ensureCapacity(3 * len);
+        byte[] buffer = null;
+        char[] cBuffer = null;
+        if (3 * len <= byteBuffer.length) {
+            buffer = byteBuffer;
+        } else {
+            buffer = new byte[3 * len];
+        }
+
+        if (len <= charBuffer.length) {
+            cBuffer = charBuffer;
+        } else {
+            cBuffer = new char[len];
+        }
+        s.getChars(0, len, cBuffer, 0);
+
+        int j = 0;
         for (int i = 0; i < len; i++) {
-            int c = s.charAt(i);
+            int c = cBuffer[i];
             if (c < 0x80) {
-                b.put((byte) c);
+                buffer[j++] = (byte) c;
             } else if (c >= 0x800) {
-                b.put((byte) (0xe0 | (c >> 12)));
-                b.put((byte) (((c >> 6) & 0x3f)));
-                b.put((byte) (c & 0x3f));
+                buffer[j++] = (byte) (0xe0 | (c >> 12));
+                buffer[j++] = (byte) (((c >> 6) & 0x3f));
+                buffer[j++] = (byte) (c & 0x3f);
             } else {
-                b.put((byte) (0xc0 | (c >> 6)));
-                b.put((byte) (c & 0x3f));
+                buffer[j++] = (byte) (0xc0 | (c >> 6));
+                buffer[j++] = (byte) (c & 0x3f);
             }
         }
+        put(buffer, 0, j);
+//        ByteBuffer b = ensureCapacity(3 * len);
+//        for (int i = 0; i < len; i++) {
+//            int c = s.charAt(i);
+//            if (c < 0x80) {
+//                b.put((byte) c);
+//            } else if (c >= 0x800) {
+//                b.put((byte) (0xe0 | (c >> 12)));
+//                b.put((byte) (((c >> 6) & 0x3f)));
+//                b.put((byte) (c & 0x3f));
+//            } else {
+//                b.put((byte) (0xc0 | (c >> 6)));
+//                b.put((byte) (c & 0x3f));
+//            }
+//        }
         return this;
     }
 

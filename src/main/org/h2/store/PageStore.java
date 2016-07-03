@@ -204,6 +204,9 @@ public class PageStore implements CacheWriter {
     private boolean readMode;
     private int backupLevel;
 
+    private int readRequest;
+    private int readHit;
+
     /**
      * Create a new page store object.
      *
@@ -417,6 +420,9 @@ public class PageStore implements CacheWriter {
         Collections.sort(list);
         for (int i = 0, size = list.size(); i < size; i++) {
             writeBack(list.get(i));
+        }
+        if (list.size() > 0) {
+            trace.info("writeback page size:" + list.size());
         }
     }
 
@@ -742,9 +748,13 @@ public class PageStore implements CacheWriter {
      */
     public synchronized Page getPage(int pageId) {
         Page p = (Page) cache.get(pageId);
+        readRequest++;
         if (p != null) {
+
+            readHit++;
             return p;
         }
+
 
         Data data = createData();
         readPage(pageId, data);
@@ -1014,6 +1024,9 @@ public class PageStore implements CacheWriter {
                 file = null;
             }
         }
+
+        trace.info("cache hit:" + readHit + " request:" + readRequest +
+                " ratio:" + Double.toString(Math.round((double)readHit / readRequest * 10000) / 100.0));
     }
 
     @Override

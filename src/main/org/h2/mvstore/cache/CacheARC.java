@@ -31,14 +31,15 @@ public class CacheARC<V> {
 
     private int p;
 
-    //Map entries.
-    //Better Implement for
-    // 1. key is long, not need to create object
-    // 2. better customized hash function. see answered by Thomas Mueller
-    // http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
+    /**Map entries.
+    /* Better Implement for
+    /* 1. key is long, not need to create object
+    /* 2. better customized hash function. see answered by Thomas Mueller
+    /* http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
+    */
     private Entry<V>[] entries;
 
-    static class Entry<V> {
+    public static class Entry<V> {
         private static final int NOT_IN_LIST = -1;
         private static final int IN_T1 = 0;
         private static final int IN_B1 = 1;
@@ -81,7 +82,9 @@ public class CacheARC<V> {
         sizeCache = Integer.highestOneBit((len - 1) << 1);
 
         //overflow problem?
-        entries = new Entry[2 * sizeCache];
+        @SuppressWarnings("unchecked")
+        Entry<V>[] e = new Entry[2 * sizeCache];
+        entries = e;
 
         list1 = new Entry<V>();
         list1.prev = list1.next = list1;
@@ -212,7 +215,10 @@ public class CacheARC<V> {
 
 
     public void clear() {
-        entries = new Entry[2 * sizeCache];
+        @SuppressWarnings("unchecked")
+        Entry<V>[] e = new Entry[2 * sizeCache];
+        entries = e;
+
 
         list1 = new Entry<V>();
         list1.prev = list1.next = list1;
@@ -329,9 +335,10 @@ public class CacheARC<V> {
 
 
     static int getHash(long key) {
-        //copy from CacheLongKeyLIRS
-        //http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
-        int hash = (int) ((key >>> 32) ^ key);
+        /**copy from CacheLongKeyLIRS
+        /* http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
+        */
+         int hash = (int) ((key >>> 32) ^ key);
         // a supplemental secondary hash function
         // to protect against hash codes that don't differ much
         hash = ((hash >>> 16) ^ hash) * 0x45d9f3b;
@@ -343,6 +350,7 @@ public class CacheARC<V> {
     // for test
     // 0 is T1, 1 is B1, 2 is T2, 3 is B2
     Entry<V>[][] getList() {
+        @SuppressWarnings("unchecked")
         Entry<V>[][] res = new Entry[4][2 * sizeCache];
         int i = 0;
         for (Entry<V> e = list1.next; e != mid1.next; e = e.next) {

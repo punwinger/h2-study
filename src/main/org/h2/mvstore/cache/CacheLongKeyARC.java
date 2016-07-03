@@ -31,7 +31,10 @@ public class CacheLongKeyARC<V> {
         this.averageMemory = averageMemory;
         this.segmentCount = segmentCount;
         this.segmentMask = segmentCount - 1;
-        segments = new Segment[segmentCount];
+        @SuppressWarnings("unchecked")
+        Segment<V>[] s = new Segment[segmentCount];
+        segments = s;
+
         clear();
 
         this.segmentShift = Integer.numberOfTrailingZeros(
@@ -68,8 +71,9 @@ public class CacheLongKeyARC<V> {
     }
 
     static int getHash(long key) {
-        //copy from CacheLongKeyLIRS
-        //http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
+        /**copy from CacheLongKeyLIRS
+        /* http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
+        */
         int hash = (int) ((key >>> 32) ^ key);
         // a supplemental secondary hash function
         // to protect against hash codes that don't differ much
@@ -142,11 +146,12 @@ public class CacheLongKeyARC<V> {
 
         private int p;
 
-        //Map entries.
-        //Better Implement for
-        // 1. key is long, not need to create object
-        // 2. better customized hash function. see answered by Thomas Mueller
-        // http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
+        /**Map entries.
+        /* Better Implement for
+        /* 1. key is long, not need to create object
+        /* 2. better customized hash function. see answered by Thomas Mueller
+        /* http://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key;
+         */
         private Entry<V>[] entries;
 
 
@@ -156,7 +161,9 @@ public class CacheLongKeyARC<V> {
             sizeCache = Integer.highestOneBit((len - 1) << 1);
 
             //overflow problem?
-            entries = new Entry[2 * sizeCache];
+            @SuppressWarnings("unchecked")
+            Entry<V>[] e = new Entry[2 * sizeCache];
+            entries = e;
 
             list1 = new Entry<V>();
             list1.prev = list1.next = list1;
@@ -281,7 +288,9 @@ public class CacheLongKeyARC<V> {
 
 
         public void clear() {
-            entries = new Entry[2 * sizeCache];
+            @SuppressWarnings("unchecked")
+            Entry<V>[] e = new Entry[2 * sizeCache];
+            entries = e;
 
             list1 = new Entry<V>();
             list1.prev = list1.next = list1;

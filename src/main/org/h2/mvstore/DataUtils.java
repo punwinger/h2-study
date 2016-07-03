@@ -317,17 +317,20 @@ public class DataUtils {
      */
     public static String readString(ByteBuffer buff, int len) {
         char[] chars = new char[len];
+        byte[] bytes = buff.array();
+        int j = buff.position() + buff.arrayOffset();
         for (int i = 0; i < len; i++) {
-            int x = buff.get() & 0xff;
+            int x = bytes[j++] & 0xff;
             if (x < 0x80) {
                 chars[i] = (char) x;
             } else if (x >= 0xe0) {
                 chars[i] = (char) (((x & 0xf) << 12)
-                        + ((buff.get() & 0x3f) << 6) + (buff.get() & 0x3f));
+                        + ((bytes[j++] & 0x3f) << 6) + (bytes[j++] & 0x3f));
             } else {
-                chars[i] = (char) (((x & 0x1f) << 6) + (buff.get() & 0x3f));
+                chars[i] = (char) (((x & 0x1f) << 6) + (bytes[j++] & 0x3f));
             }
         }
+        buff.position(j - buff.arrayOffset());
         return new String(chars);
     }
 

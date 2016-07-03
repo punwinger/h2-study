@@ -34,6 +34,8 @@ public class PageOutputStream {
     private int pageCount;
     private int logKey;
 
+    private int writePageCount;
+
     /**
      * Create a new page output stream.
      *
@@ -146,6 +148,7 @@ public class PageOutputStream {
             trace.debug("pageOut.storePage " + data);
         }
         data.write();
+        writePageCount++;
     }
 
     /**
@@ -155,6 +158,9 @@ public class PageOutputStream {
         if (needFlush) {
             storePage();
             needFlush = false;
+
+            trace.info("flush! write page:" + writePageCount);
+            writePageCount = 0;
         }
     }
 
