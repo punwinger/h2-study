@@ -10,14 +10,24 @@
  * 0. You just DO WHAT THE FUCK YOU WANT TO.
  */
 
-package org.h2.faststore.lock;
+package org.h2.faststore.index;
+
+/**
+ * nonleaf page & leaf page?
+ *
+ * nonleaf:
+ * no MVCC info
+ * only key store
+ *
+ * leaf:
+ * MVCC
+ * key + value
+ *
+ * redo & logical undo problem? physically redo or operationally undo(mvcc)
+ * operationally undo can work concurrent, physically can be faster only single thread
+ *
+ */
+public class FSIndexPage {
 
 
-import org.h2.engine.Session;
-
-public interface LockBase {
-
-    void lockSession(Session session, boolean exclusive);
-
-    void unlockSession(Session s);
 }

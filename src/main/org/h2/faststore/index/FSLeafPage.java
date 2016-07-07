@@ -10,15 +10,7 @@
  * 0. You just DO WHAT THE FUCK YOU WANT TO.
  */
 
-package org.h2.faststore.lock;
+package org.h2.faststore.index;
 
-
-import org.h2.engine.Session;
-
-import java.util.ArrayList;
-import java.util.Set;
-
-public interface LockEntity {
-
-    ArrayList<Session> findDeadLock(Session session, Session clash, Set<Session> visited);
+public class FSLeafPage {
 }
