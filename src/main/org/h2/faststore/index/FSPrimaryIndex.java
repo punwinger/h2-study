@@ -41,6 +41,10 @@ public class FSPrimaryIndex extends BaseIndex implements LockBase {
     private FSTable table;
     private SXLock indexLock;
 
+    //support large file
+    private long rootPageId;
+
+
     public FSPrimaryIndex(Database db, FSTable table, int id,
                           IndexColumn[] columns, IndexType indexType) {
         initBaseIndex(table, id, table.getName() + "_DATA", columns, indexType);
@@ -70,7 +74,7 @@ public class FSPrimaryIndex extends BaseIndex implements LockBase {
     }
 
     // add & split
-    // rowList??
+    // rowList??  -> add(Session session, RowList list)
     // add(no split):
     // 1.index share lock
     // 2.binary search to find the leaf page
@@ -87,11 +91,18 @@ public class FSPrimaryIndex extends BaseIndex implements LockBase {
     // 4.split leaf page (split point @ 1/3, 2/3)
     // take care of row lock
     // 5. to be continued...
+
+    // root split
+    // keep old root id unchanged and update two new node
     @Override
     public void add(Session session, Row row) {
+        //no spilt add
+        indexLock.lock(session, false);
 
 
     }
+
+
 
     @Override
     public void remove(Session session, Row row) {

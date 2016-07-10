@@ -12,6 +12,9 @@
 
 package org.h2.faststore.index;
 
+import org.h2.faststore.type.FSRecord;
+import org.h2.result.SearchRow;
+
 /**
  * nonleaf page & leaf page?
  *
@@ -24,10 +27,23 @@ package org.h2.faststore.index;
  * key + value
  *
  * redo & logical undo problem? physically redo or operationally undo(mvcc)
- * operationally undo can work concurrent, physically can be faster only single thread
+ * operationally undo can work concurrent, physically can be faster with single thread
  *
  */
-public class FSIndexPage {
+public class FSIndexPage extends PageBase {
 
 
+    public FSIndexPage(FSIndex index) {
+        super(index);
+    }
+
+    @Override
+    public boolean tryFastAddRow(FSRecord row) {
+        return false;
+    }
+
+    @Override
+    public long realAddRow(FSRecord row) {
+        return 0;
+    }
 }

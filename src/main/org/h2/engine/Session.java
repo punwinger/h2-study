@@ -19,7 +19,8 @@ import org.h2.command.Parser;
 import org.h2.command.Prepared;
 import org.h2.command.dml.SetTypes;
 import org.h2.constraint.Constraint;
-import org.h2.faststore.lock.LockEntity;
+import org.h2.faststore.lock.LockBase;
+import org.h2.faststore.lock.SXLock;
 import org.h2.index.Index;
 import org.h2.jdbc.JdbcConnection;
 import org.h2.message.DbException;
@@ -127,6 +128,17 @@ public class Session extends SessionWithState {
         this.lockTimeout = setting == null ?
                 Constants.INITIAL_LOCK_TIMEOUT : setting.getIntValue();
         this.currentSchemaName = Constants.SCHEMA_MAIN;
+    }
+
+    /**
+     * for test
+     */
+    public Session() {
+        database = null;
+        user = null;
+        id = 0;
+        undoLog = null;
+        queryCacheSize = 0;
     }
 
     public boolean setCommitOrRollbackDisabled(boolean x) {
@@ -1468,14 +1480,21 @@ public class Session extends SessionWithState {
 
 
     //======================== For FastStore ========================
-    private LockEntity waitForEntity;
+    private volatile SXLock fsWaitForLock;
+    private ArrayList<LockBase> fsLocks;
 
-    public void setWaitForEntity(LockEntity entity) {
-        waitForEntity = entity;
+    public void fsSetWaitForLock(SXLock lock) {
+        fsWaitForLock = lock;
     }
 
-    public LockEntity getWaitForEntity() {
-        return waitForEntity;
+    public SXLock fsGetWaitForLock() {
+        return fsWaitForLock;
     }
+
+    //TODO unlock?
+    public void fsAddLocks(LockBase lock) {
+        fsLocks.add(lock);
+    }
+
 
 }

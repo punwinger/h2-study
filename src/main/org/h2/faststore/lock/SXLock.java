@@ -55,7 +55,7 @@ public class SXLock {
                     //must release readLock before acquire write lock
                     readLock.unlock();
                     lockShared.remove(session);
-                    session.fsSetWaitForLock(null);
+                    //session.fsSetWaitForLock(null);
                 } else {
                     return;
                 }
@@ -83,8 +83,7 @@ public class SXLock {
 
     private void doLock(boolean exclusive, Session session) {
         long max = 0;
-        //int deadlock_check = Constants.DEADLOCK_CHECK;
-        int deadlock_check = 1000;
+        int deadlock_check = Constants.DEADLOCK_CHECK;
 
         //+1 for check dead lock after first tryLock fail
         long sleep = deadlock_check + 1;
@@ -108,7 +107,7 @@ public class SXLock {
                 max = System.currentTimeMillis() + session.getLockTimeout() - sleep;
             }
 
-            // TODO aysnc check dead lock: wait a short moment and async check\
+            // TODO aysnc check dead lock: wait a short moment and async check
             // only left time is big enough we check dead lock
             if (sleep > deadlock_check) {
                 ArrayList<Session> sessions = findDeadLock(session);
@@ -197,12 +196,11 @@ public class SXLock {
                     // other thread may modify the lock...
                     // ignore here
                     // maybe get the innerlock and try again ?
-                    holder = new ArrayList<>(1);
                 }
             }
 
             Session s = null;
-            while(index < holder.size()) {
+            while(holder != null && index < holder.size()) {
                 s = holder.get(index++);
                 if (s == waitSession) {
                     // It's ok that wait session already get the lock
@@ -220,11 +218,13 @@ public class SXLock {
         }
     }
 
+    //TODO multi-thread may be problem !!
     private ArrayList<Session> findDeadLock(Session checkSession) {
         ArrayList<Session> res = null;
         HashSet<Session> visited = new HashSet<>();
         LinkedList<DFSContext> stack = new LinkedList<>();
 
+        // need thread sync here
         SXLock lock = checkSession.fsGetWaitForLock();
         DFSContext ctx = new DFSContext(lock, checkSession);
         Session s = ctx.nextSession();

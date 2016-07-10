@@ -12,5 +12,21 @@
 
 package org.h2.faststore.index;
 
-public class FSLeafPage {
+import org.h2.result.SearchRow;
+
+public class FSLeafPage extends PageBase {
+    @Override
+    public boolean tryFastAddRow(SearchRow row) {
+        return false;
+    }
+
+    @Override
+    public long realAddRow(SearchRow row) {
+        return 0;
+    }
+
+    @Override
+    public boolean isLeaf() {
+        return true;
+    }
 }

@@ -66,9 +66,9 @@ public class TestSXLock {
             @Override
             public void run() {
                 s1.lock(l1, false);
-                sleeNoException(lockWaitTime);
+                sleepNoException(lockWaitTime);
                 s1.lock(l3, true);
-                sleeNoException(threadKeepTime);
+                sleepNoException(threadKeepTime);
             }
         }, "s1").start();
 
@@ -77,7 +77,7 @@ public class TestSXLock {
             @Override
             public void run() {
                 s2.lock(l1, false);
-                sleeNoException(threadKeepTime);
+                sleepNoException(threadKeepTime);
             }
         }, "s2").start();
 
@@ -85,9 +85,9 @@ public class TestSXLock {
             @Override
             public void run() {
                 s4.lock(l2, true);
-                sleeNoException(lockWaitTime);
+                sleepNoException(lockWaitTime);
                 s4.lock(l3, true);
-                sleeNoException(threadKeepTime);
+                sleepNoException(threadKeepTime);
             }
         }, "s4").start();
 
@@ -96,9 +96,9 @@ public class TestSXLock {
             @Override
             public void run() {
                 s5.lock(l3, false);
-                sleeNoException(lockWaitTime);
+                sleepNoException(lockWaitTime);
                 s5.lock(l1, true);
-                sleeNoException(threadKeepTime);
+                sleepNoException(threadKeepTime);
             }
         }, "s5").start();
 
@@ -106,20 +106,20 @@ public class TestSXLock {
             @Override
             public void run() {
                 s6.lock(l3, false);
-                sleeNoException(lockWaitTime);
+                sleepNoException(lockWaitTime);
                 s6.lock(l1, true);
-                sleeNoException(threadKeepTime);
+                sleepNoException(threadKeepTime);
             }
         }, "s6").start();
 
 
         s3.lock(l1, false);
-        sleeNoException(lockWaitTime);
+        sleepNoException(lockWaitTime);
         s3.lock(l2, false);
-        sleeNoException(threadKeepTime);
+        sleepNoException(threadKeepTime);
     }
 
-    private static void sleeNoException(long millis) {
+    private static void sleepNoException(long millis) {
         try {
             Thread.sleep(millis);
         } catch (InterruptedException e) {
