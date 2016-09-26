@@ -13,19 +13,27 @@
 package org.h2.faststore.index;
 
 
+import org.h2.api.ErrorCode;
 import org.h2.engine.Database;
 import org.h2.engine.Session;
 import org.h2.faststore.FSTable;
-import org.h2.faststore.lock.LockBase;
-import org.h2.faststore.lock.SXLock;
+import org.h2.faststore.FastStore;
+import org.h2.faststore.sync.LockBase;
+import org.h2.faststore.sync.SXLock;
+import org.h2.faststore.type.FSRecord;
 import org.h2.index.BaseIndex;
 import org.h2.index.Cursor;
 import org.h2.index.IndexType;
+import org.h2.message.DbException;
 import org.h2.result.Row;
 import org.h2.result.SearchRow;
 import org.h2.result.SortOrder;
+import org.h2.table.Column;
 import org.h2.table.IndexColumn;
 import org.h2.table.TableFilter;
+import org.h2.value.Value;
+import org.h2.value.ValueArray;
+import org.h2.value.ValueLong;
 
 /**
  * TODO
@@ -37,18 +45,13 @@ import org.h2.table.TableFilter;
  * 6. undo/redo
  *
  */
-public class FSPrimaryIndex extends BaseIndex implements LockBase {
-    private FSTable table;
+public class FSPrimaryIndex extends FSIndex implements LockBase {
     private SXLock indexLock;
 
-    //support large file
-    private long rootPageId;
-
-
-    public FSPrimaryIndex(Database db, FSTable table, int id,
+    public FSPrimaryIndex(Database db, FSTable table, FastStore fastStore, int id,
                           IndexColumn[] columns, IndexType indexType) {
+        super(table, fastStore);
         initBaseIndex(table, id, table.getName() + "_DATA", columns, indexType);
-        this.table = table;
         indexLock = new SXLock(getName());
     }
 
@@ -92,12 +95,76 @@ public class FSPrimaryIndex extends BaseIndex implements LockBase {
     // take care of row lock
     // 5. to be continued...
 
+
     // root split
     // keep old root id unchanged and update two new node
     @Override
     public void add(Session session, Row row) {
         //no spilt add
-        indexLock.lock(session, false);
+        //indexLock.lock(session, false);
+
+        //check whether need to split
+        FSRecord rec = createFSRecord(row);
+        FSLeafPage firstLeaf = searchFirstLeaf(session, rec);
+
+        if (firstLeaf.getMemory() + rec.getMemory() >= fastStore.getPageSplitSize()
+                && firstLeaf.getEntryCount() > 1) {
+            //page split
+
+
+        }
+
+
+
+
+    }
+
+    private FSLeafPage searchFirstLeaf(Session session, FSRecord rec) {
+        InnerSearchCursor innerCursor = new InnerSearchCursor(this, fastStore);
+        PageBase from = null;
+        while (true) {
+            FSLeafPage firstLeaf =  innerCursor.searchLeaf(session, from, rec, true, true);
+            if (firstLeaf != null) {
+                return firstLeaf;
+            } else {
+                from = innerCursor.traverseBack(session);
+            }
+        }
+    }
+
+    private void pageSplit(Session session, FSLeafPage firstLeaf) {
+        FSLeafPage secondLeaf = (FSLeafPage) fastStore.getPage(firstLeaf.getNextPageId());
+        if (secondLeaf != null) {
+            fastStore.fixPage(secondLeaf.getPageId());
+        }
+
+        latch.latch(session, true);
+
+        long newPageId = fastStore.allocatePage();
+        FSLeafPage leafPage = FSLeafPage.create(newPageId, this);
+        leafPage.latch(session, true);
+        leafPage.setSMBit(true);
+        leafPage.setNextPageId(secondLeaf == null ? 0 : secondLeaf.getPageId());
+        firstLeaf.setSMBit(true);
+        firstLeaf.setNextPageId(newPageId);
+
+        //TODO split point
+        int splitPoint = 0;
+
+
+//
+//        if (tryOnly && entryCount > 1) {
+//            int x = find(row, false, true, true);
+//            if (entryCount < 5) {
+//                // required, otherwise the index doesn't work correctly
+//                return entryCount / 2;
+//            }
+//            // split near the insertion point to better fill pages
+//            // split in half would be:
+//            // return entryCount / 2;
+//            int third = entryCount / 3;
+//            return x < third ? third : x >= 2 * third ? 2 * third : x;
+//        }
 
 
     }
@@ -109,13 +176,8 @@ public class FSPrimaryIndex extends BaseIndex implements LockBase {
         //in-place update ?
     }
 
-    @Override
-    public Cursor find(Session session, SearchRow first, SearchRow last) {
-        // 1.index share lock
-        // 2.No leaf page share lock, keep thread safe
 
-        return null;
-    }
+
 
     @Override
     public double getCost(Session session, int[] masks, TableFilter filter, SortOrder sortOrder) {

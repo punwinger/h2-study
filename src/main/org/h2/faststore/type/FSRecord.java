@@ -21,22 +21,24 @@ import org.h2.table.Table;
 import org.h2.value.CompareMode;
 import org.h2.value.Value;
 
+import java.util.Arrays;
+
 public class FSRecord implements SearchRow {
 
     private int owned;
 
     private FSRecord next;
 
-    // if key, data store only index columns
-    // if value, primary index, data store whole row
-    //if value, secondary index, data store the primary index columns
+    //store whole row, null if not exist
     private Value[] data;
 
+    private long innerKey;
 
-    public FSRecord(Table table, int length) {
+    private int offset = -1;
+
+    public FSRecord(int length) {
         data = new Value[length];
     }
-
 
     public int compare(FSRecord other, int[] columnId,
                            IndexColumn[] indexColumns, CompareMode compareMode) {
@@ -57,7 +59,7 @@ public class FSRecord implements SearchRow {
 //                return c;
 //            }
 
-            Value a = data[i];
+            Value a = data[index];
             if (a == null) {
                 return SortOrder.compareNull(true, indexColumns[i].sortType);
             }
@@ -104,12 +106,12 @@ public class FSRecord implements SearchRow {
 
     @Override
     public Value getValue(int index) {
-        return null;
+        return data[index];
     }
 
     @Override
     public void setValue(int index, Value v) {
-
+        data[index] = v;
     }
 
     @Override
@@ -124,16 +126,38 @@ public class FSRecord implements SearchRow {
 
     @Override
     public void setKey(long key) {
-
+        this.innerKey = key;
     }
 
     @Override
     public long getKey() {
-        return 0;
+        return innerKey;
     }
 
     @Override
     public int getMemory() {
         return 0;
+    }
+
+    public FSRecord getNext() {
+        return next;
+    }
+
+    public void setNext(FSRecord next) {
+        this.next = next;
+    }
+
+    public void setOffset (int offset) {
+        this.offset = offset;
+    }
+
+    public int getOffset() {
+        return offset;
+    }
+
+    @Override
+    public String toString() {
+        return "FSRecord key:" + innerKey + " offset:" + offset
+                + " data:" + Arrays.toString(data);
     }
 }

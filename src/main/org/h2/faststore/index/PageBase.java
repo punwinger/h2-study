@@ -12,6 +12,8 @@
 
 package org.h2.faststore.index;
 
+import org.h2.engine.Session;
+import org.h2.faststore.sync.SXLatch;
 import org.h2.faststore.type.FSRecord;
 import org.h2.result.SearchRow;
 
@@ -29,65 +31,92 @@ import org.h2.result.SearchRow;
  * PageBtree, rows[], offsets[],
  *
  */
-abstract class PageBase {
+public abstract class PageBase {
 
     private int pageSize;
 
-    private int entryCount;
+    protected int entryCount;
 
     private long pageId;
 
+    private boolean sm_bit;
+
     protected FSIndex index;
 
+    protected long parentPageId;
 
-    //leaf
-    //array(record -> record -> record -> ...) + directory
-    private FSRecord[] directory;
-    private FSRecord[] records;
+    //TODO or something like this
+    private long pageLSN;
 
-    //node
-    //array(record, record, record, ...)
-    private FSRecord[] keys;
-    private long[] childPageIds;
+    private SXLatch latch;
 
-
-
-    public PageBase(FSIndex index) {
+    public PageBase(long pageId, FSIndex index) {
+        this.pageId = pageId;
         this.index = index;
+        latch = new SXLatch(index.getName() + "-page " + pageId);
     }
 
 
     abstract public boolean tryFastAddRow(FSRecord row);
-
     //return split point
     abstract public long realAddRow(FSRecord row);
 
+    abstract public FSRecord getMinMaxKey(boolean min);
+
+    // bigger  true for the next bigger row, false for the first row = target
+    // compareKeys true for compare the row key, for delete
+
+    //add?
+    abstract public int binarySearch(FSRecord target, boolean bigger, boolean compareInnerKey);
 
 
-    // only for node page
-    public int binarySearch(FSRecord target) {
-        int l = 0, r = entryCount - 1;
-        int m = 0;
-        while (l <= r) {
-            m = (l + r) >>> 1;
-            int cmp = index.compareRecord(keys[m], target);
-            if (cmp == 0) {
-                return m;
-            } else if (cmp > 0) {
-                r = m - 1;
-            } else {
-                l = m + 1;
-            }
-        }
+    abstract public int getMemory();
 
-        return -(l + 1);
+    public long getPageId() {
+        return pageId;
     }
 
+    public void setPageId(long pageId) {
+        this.pageId = pageId;
+    }
+
+    public long getPageLSN() {
+        return pageLSN;
+    }
+
+    public void setPageLSN(long pageLSN) {
+        this.pageLSN = pageLSN;
+    }
+
+    public void latch(Session session, boolean exclusive) {
+        latch.latch(session, exclusive);
+    }
+
+    public void unlatch(Session session) {
+        latch.unlatch(session);
+    }
+
+    public boolean isEmptyPage() {
+        return entryCount == 0;
+    }
+
+    public int getEntryCount() {
+        return entryCount;
+    }
+
+    public boolean getSMBit() {
+        return sm_bit;
+    }
+
+    public void setSMBit(boolean sm_bit) {
+        this.sm_bit = sm_bit;
+    }
 
 
     public boolean isLeaf() {
         return false;
     }
+
 
 
 }

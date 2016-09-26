@@ -15,8 +15,8 @@ package org.h2.faststore;
 import org.h2.api.ErrorCode;
 import org.h2.command.ddl.CreateTableData;
 import org.h2.engine.Session;
-import org.h2.faststore.lock.LockBase;
-import org.h2.faststore.lock.SXLock;
+import org.h2.faststore.sync.LockBase;
+import org.h2.faststore.sync.SXLock;
 import org.h2.index.BaseIndex;
 import org.h2.index.Index;
 import org.h2.index.IndexType;
@@ -30,11 +30,13 @@ import java.util.concurrent.locks.ReentrantLock;
 public class FSTable extends TableBase implements LockBase {
     private ReentrantLock innerlock = new ReentrantLock();
     private SXLock tableLock;
+    private FastStore fastStore;
 
 
-    public FSTable(CreateTableData data) {
+    public FSTable(CreateTableData data, FastStore fastStore) {
         super(data);
         tableLock = new SXLock(getName());
+        this.fastStore = fastStore;
     }
 
     @Override
