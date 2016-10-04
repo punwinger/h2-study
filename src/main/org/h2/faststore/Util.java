@@ -12,6 +12,8 @@
 
 package org.h2.faststore;
 
+import java.lang.reflect.Array;
+
 public class Util {
 
     public static String array2String(Object[] a, int size) {

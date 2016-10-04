@@ -19,6 +19,7 @@ import org.h2.util.New;
 
 import java.util.LinkedList;
 
+//TODO this is loop implement. maybe try stack iterate like page.find() -> leaf.find()
 public class InnerSearchCursor {
     static class Info {
         public long pageId;
@@ -62,8 +63,9 @@ public class InnerSearchCursor {
     }
 
     //return null while SMO
+    // no siblings visit
     public FSLeafPage searchLeaf(Session session, PageBase from, FSRecord record,
-                                 boolean compareInnerKey, boolean latchExclusive) {
+                                 boolean checkDuplicate, boolean latchExclusive) {
         PageBase parent = null;
         PageBase child = from == null ? fastStore.getPage(index.getRootPageId()) : from;
         FSLeafPage firstLeaf = null;
@@ -81,12 +83,9 @@ public class InnerSearchCursor {
                         parent.unlatch(session);
                     }
                     parent = child;
-                    int idx = child.binarySearch(record, false, compareInnerKey);
-                    if (idx < 0) {
-                        idx = -idx - 1;
-                    }
-                    child = fastStore.getPage(idx);
 
+                    long pageID = ((FSNodePage)child).findPage(record, checkDuplicate);
+                    child = fastStore.getPage(pageID);
                 } else {
                     //encounter page split/delete
                     if (parent != null) {

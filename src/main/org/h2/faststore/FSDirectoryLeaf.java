@@ -19,7 +19,6 @@ import org.h2.value.CompareMode;
 
 import java.util.Arrays;
 
-//TODO 是否compact. compact由于一般需要记录整个页的数据，会大大增加redo/undo日志大小
 public class FSDirectoryLeaf extends FSLeaf {
 
     private static final int MAX_DIRECTORY_SIZE = 8;
@@ -38,7 +37,7 @@ public class FSDirectoryLeaf extends FSLeaf {
     private int directorySize;
     private SpaceManager spaceManager;
 
-    private static class SpacePos {
+    static class SpacePos {
         public int left;  //include
         public int right;  //include
 
@@ -57,6 +56,7 @@ public class FSDirectoryLeaf extends FSLeaf {
         }
     }
 
+    //TODO SpaceManager是否compact. compact由于一般需要记录整个页的数据，会大大增加redo/undo日志大小
     private static class SpaceManager {
         private SpacePos[] poses;
         private int count;
@@ -149,7 +149,7 @@ public class FSDirectoryLeaf extends FSLeaf {
         }
     }
 
-    private static class Directory {
+    class Directory {
         public int count;
         public FSRecord start;
         public FSRecord end;
@@ -195,22 +195,22 @@ public class FSDirectoryLeaf extends FSLeaf {
     public FSRecord findRecord(FSRecord cmpRecord, boolean compareInnerKey) {
         int idx = findDirectory(cmpRecord, compareInnerKey);
         if (idx >= 0) {
-            return directories[idx].start;
+            return directories[idx].end;
         }
 
-        idx = -idx - 2;
-        if (idx < 0) {
+        idx = -idx - 1;
+        if (idx >= directoryCount) {
             return null;
         }
         FSRecord record = directories[idx].start;
-        while (record.getNext() != null) {
-            record = record.getNext();
+        for (int i = 0; i < directories[idx].count - 1; i++) {
             int cmp = record.compare(cmpRecord, columnIds, indexColumns, compareMode);
             if (cmp == 0) {
                 return record;
             } else if (cmp > 0) {
                 break;
             }
+            record = record.getNext();
         }
 
         return null;
@@ -221,7 +221,7 @@ public class FSDirectoryLeaf extends FSLeaf {
         int l = 0, r = directoryCount - 1;
         while (l <= r) {
             int m = (l + r) >>> 1;
-            FSRecord record = directories[m].start;
+            FSRecord record = directories[m].end;
             int c = record.compare(cmpRecord, columnIds, indexColumns, compareMode);
             if (c == 0 && compareInnerKey) {
                 c = compareInnerKey(record, cmpRecord);
@@ -235,7 +235,7 @@ public class FSDirectoryLeaf extends FSLeaf {
                 l = m + 1;
             }
         }
-        return -(r + 2);
+        return -(l + 1);
     }
 
     //unique insert. no duplicate allow
@@ -257,7 +257,7 @@ public class FSDirectoryLeaf extends FSLeaf {
                 return -1;
             }
 
-            idx = -idx - 2;
+            idx = -idx - 1;
 
             if (directoryCount < 5) {
                 return directoryCount / 2;
@@ -290,54 +290,48 @@ public class FSDirectoryLeaf extends FSLeaf {
             //DbException.throwInternalError("Duplicate record");
             return -1;
         }
-        insertPoint = -insertPoint - 2;
+        insertPoint = -insertPoint - 1;
         Directory dir = null;
-        if (insertPoint < 0) {
-            //record < directories[0].start
-            insertPoint = insertPosInDir = 0;
-            dir = directories[insertPoint];
-            record.setNext(dir.start);
-            dir.start = record;
+        if (insertPoint >= directoryCount) {
+            //record > directories[directoryCount - 1].end
+            dir = directories[directoryCount - 1];
+            insertPoint = directoryCount - 1;
+            insertPosInDir = dir.count;
+            dir.end.setNext(record);
+            dir.end = record;
+            record.setNext(null);
         } else {
             //insert into directories
             dir = directories[insertPoint];
-            FSRecord prev = dir.start;
+            FSRecord cur = dir.start;
+            FSRecord prev = insertPoint > 0 ? directories[insertPoint - 1].end : null;
 
             boolean hasInsert = false;
-            for (insertPosInDir = 1; insertPosInDir <= dir.count; ++insertPosInDir) {
-                FSRecord cur = prev.getNext();
-                if (cur == null) {
-                    prev.setNext(record);
-                    hasInsert = true;
-                    break;
-                }
+            for (insertPosInDir = 0; insertPosInDir < dir.count; ++insertPosInDir) {
                 int cmp = compareRecord(cur, record);
                 if (cmp == 0) {
                     //DbException.throwInternalError("Duplicate record");
                     return -1;
-                }
-                if (cmp > 0) {
+                } else if (cmp > 0) {
                     record.setNext(cur);
-                    prev.setNext(record);
+                    if (prev != null) {
+                        prev.setNext(record);
+                    }
+                    if (insertPosInDir == 0) {
+                        dir.start = record;
+                    }
                     hasInsert = true;
                     break;
                 }
                 prev = cur;
+                cur = cur.getNext();
             }
 
             if (!hasInsert) {
-                if (insertPoint == directoryCount - 1) {
-                    dir.end.setNext(record);
-                    record.setNext(null);
-                } else {
-                    DbException.throwInternalError("Directory cannot find pos to insert. insert:"
-                                    + record + " dir:" + dir + " detail:" + toString());
-                }
+                DbException.throwInternalError("Directory cannot find pos to insert. insert:"
+                        + record + " dir:" + dir + " detail:" + toString());
             }
 
-            if (insertPosInDir == dir.count) {
-                dir.end = record;
-            }
         }
 
         if (++dir.count > directorySize) {
@@ -367,6 +361,8 @@ public class FSDirectoryLeaf extends FSLeaf {
         return -1;
     }
 
+    //TODO use cursor to delete
+    //this is find then delete
     @Override
     public FSRecord removeRow(FSRecord record) {
         int dirPos = 0;
@@ -378,51 +374,58 @@ public class FSDirectoryLeaf extends FSLeaf {
         dirPos = findDirectory(record, true);
         if (dirPos >= 0) {
             Directory dir = directories[dirPos];
-            del = dir.start;
+            del = dir.end;
             if (dir.count == 1) {
                 //remove the directory
                 directories = removeFromArray(directories, directoryCount, dirPos);
                 directoryCount--;
-            } else {
-                dir.start = del.getNext();
-                dir.count--;
-            }
 
-            if (dirPos > 0) {
-                //adjust the prev
-                FSRecord lastEnd = directories[dirPos - 1].end;
-                FSRecord newNext = dirPos < directoryCount ? directories[dirPos].start : null;
-                lastEnd.setNext(newNext);
+                if (dirPos > 0) {
+                    //adjust the prev
+                    FSRecord lastEnd = directories[dirPos - 1].end;
+                    FSRecord newNext = dirPos < directoryCount ? directories[dirPos].start : null;
+                    lastEnd.setNext(newNext);
+                }
+            } else {
+                FSRecord newEnd = dir.start;
+                for (int i = 1; i < dir.count - 1; i++) {
+                    newEnd = newEnd.getNext();
+                }
+                newEnd.setNext(del.getNext());
+                dir.end = newEnd;
+                dir.count--;
             }
 
             entryCount--;
         } else {
-            dirPos = -dirPos - 2;
-            if (dirPos < 0) {
+            dirPos = -dirPos - 1;
+            if (dirPos >= directoryCount) {
                 //record not found
                 return null;
             }
 
             Directory dir = directories[dirPos];
-            FSRecord prev = dir.start;
-            for (int i = 1; i < dir.count; i++) {
-                FSRecord cur = prev.getNext();
+            FSRecord cur = dir.start;
+            FSRecord prev = dirPos > 0 ? directories[dirPos - 1].end : null;
+            for (int i = 0; i < dir.count - 1; i++) {
                 int cmp = compareRecord(cur, record);
                 if (cmp > 0) {
                     //not found
                     return null;
                 } else if (cmp == 0) {
-                    prev.setNext(cur.getNext());
-                    if (dir.end == cur) {
-                        dir.end = prev;
+                    if (prev != null) {
+                        prev.setNext(cur.getNext());
+                    }
+                    if (dir.start == cur) {
+                        dir.start = cur.getNext();
                     }
                     del = cur;
                     dir.count--;
                     entryCount--;
                     break;
                 }
-
                 prev = cur;
+                cur = cur.getNext();
             }
         }
 
@@ -512,37 +515,37 @@ public class FSDirectoryLeaf extends FSLeaf {
 
     //test
     //FSRecord in directories
-    public boolean checkLink() {
+    public int checkDirectoryLink() {
         int i = 0;
         FSRecord iter = directories[i].start;
         while (iter != null && i < directoryCount) {
             Directory dir = directories[i];
             if (iter != dir.start) {
-                return false;
+                return i;
             }
 
             for (int j = 0; j < dir.count - 1; j++) {
                 FSRecord next = iter.getNext();
                 if (compareRecord(next, iter) <= 0) {
-                    return false;
+                    return i;
                 }
                 iter = next;
             }
 
             if (iter != dir.end) {
-                return false;
+                return i;
             }
 
             FSRecord next = iter.getNext();
             if (next != null && compareRecord(next, iter) <=0 ) {
-                return false;
+                return i;
             }
 
             iter = next;
             i++;
         }
 
-        return true;
+        return -1;
     }
 
     //test

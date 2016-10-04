@@ -14,14 +14,34 @@ package org.h2.faststore.index;
 
 
 import org.h2.engine.Session;
+import org.h2.faststore.FSTable;
+import org.h2.faststore.FastStore;
+import org.h2.faststore.sync.LockBase;
+import org.h2.faststore.type.FSRecord;
 import org.h2.index.BaseIndex;
 import org.h2.index.Cursor;
 import org.h2.result.Row;
 import org.h2.result.SearchRow;
 import org.h2.result.SortOrder;
+import org.h2.store.Data;
 import org.h2.table.TableFilter;
 
-public class FSSecondaryIndex extends BaseIndex {
+public class FSSecondaryIndex extends FSIndex implements LockBase {
+
+    public FSSecondaryIndex(FSTable table, FastStore fastStore) {
+        super(table, fastStore);
+    }
+
+    @Override
+    public int getRowSizeInNode(Data dummy, FSRecord row) {
+        return super.getRowSizeInNode(dummy, row);
+    }
+
+    @Override
+    public int getRowSizeInLeaf(Data dummy, FSRecord row) {
+        return super.getRowSizeInLeaf(dummy, row);
+    }
+
     @Override
     public void checkRename() {
 
@@ -90,5 +110,15 @@ public class FSSecondaryIndex extends BaseIndex {
     @Override
     public long getDiskSpaceUsed() {
         return 0;
+    }
+
+    @Override
+    public void lockSession(Session session, boolean exclusive) {
+
+    }
+
+    @Override
+    public void unlockSession(Session s) {
+
     }
 }

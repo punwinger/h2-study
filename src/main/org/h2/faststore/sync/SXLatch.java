@@ -51,18 +51,21 @@ public class SXLatch {
                 return;
             } else if (lockShared.contains(session)) {
                 if (exclusive) {
+                    //TODO must upgrade without releasing lock
+                    //if two thread upgrade concurrently will be deadlock
+                    //use idea like UpdateLock, only one thread hold and holder can read
                     //must release readLock before acquire write lock
-                    needRelease = true;
-                    lockShared.remove(session);
+                    //needRelease = true;
+                    //lockShared.remove(session);
                 } else {
                     return;
                 }
             }
         }
 
-        if (needRelease) {
-            readLock.unlock();
-        }
+//        if (needRelease) {
+//            readLock.unlock();
+//        }
 
         doLatch(exclusive, session);
 

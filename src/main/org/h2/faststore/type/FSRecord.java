@@ -25,7 +25,7 @@ import java.util.Arrays;
 
 public class FSRecord implements SearchRow {
 
-    private int owned;
+//    private int owned;
 
     private FSRecord next;
 
@@ -35,6 +35,8 @@ public class FSRecord implements SearchRow {
     private long innerKey;
 
     private int offset = -1;
+
+    private long childPageId;
 
     public FSRecord(int length) {
         data = new Value[length];
@@ -159,5 +161,13 @@ public class FSRecord implements SearchRow {
     public String toString() {
         return "FSRecord key:" + innerKey + " offset:" + offset
                 + " data:" + Arrays.toString(data);
+    }
+
+    public long getChildPageId() {
+        return childPageId;
+    }
+
+    public void setChildPageId(long childPageId) {
+        this.childPageId = childPageId;
     }
 }

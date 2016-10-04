@@ -13,7 +13,6 @@
 package org.h2.faststore.index;
 
 
-import org.h2.api.ErrorCode;
 import org.h2.engine.Database;
 import org.h2.engine.Session;
 import org.h2.faststore.FSTable;
@@ -31,10 +30,6 @@ import org.h2.result.SortOrder;
 import org.h2.table.Column;
 import org.h2.table.IndexColumn;
 import org.h2.table.TableFilter;
-import org.h2.value.Value;
-import org.h2.value.ValueArray;
-import org.h2.value.ValueLong;
-
 /**
  * TODO
  * 1. index lock + row lock
@@ -105,11 +100,18 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
 
         //check whether need to split
         FSRecord rec = createFSRecord(row);
-        FSLeafPage firstLeaf = searchFirstLeaf(session, rec);
+        FSLeafPage firstLeaf = searchFirstLeaf(session, rec, true);
 
-        if (firstLeaf.getMemory() + rec.getMemory() >= fastStore.getPageSplitSize()
-                && firstLeaf.getEntryCount() > 1) {
+        int splitPoint = firstLeaf.checkNeedSplitIfAdd(rec);
+        if (splitPoint >= 0) {
             //page split
+
+
+
+
+        } else {
+
+
 
 
         }
@@ -119,11 +121,11 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
 
     }
 
-    private FSLeafPage searchFirstLeaf(Session session, FSRecord rec) {
+    private FSLeafPage searchFirstLeaf(Session session, FSRecord rec, boolean checkDuplicate) {
         InnerSearchCursor innerCursor = new InnerSearchCursor(this, fastStore);
         PageBase from = null;
         while (true) {
-            FSLeafPage firstLeaf =  innerCursor.searchLeaf(session, from, rec, true, true);
+            FSLeafPage firstLeaf =  innerCursor.searchLeaf(session, from, rec, checkDuplicate, true);
             if (firstLeaf != null) {
                 return firstLeaf;
             } else {
@@ -132,7 +134,7 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
         }
     }
 
-    private void pageSplit(Session session, FSLeafPage firstLeaf) {
+    private void pageSplit(Session session, FSLeafPage firstLeaf, int splitPoint) {
         FSLeafPage secondLeaf = (FSLeafPage) fastStore.getPage(firstLeaf.getNextPageId());
         if (secondLeaf != null) {
             fastStore.fixPage(secondLeaf.getPageId());
@@ -144,27 +146,28 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
         FSLeafPage leafPage = FSLeafPage.create(newPageId, this);
         leafPage.latch(session, true);
         leafPage.setSMBit(true);
-        leafPage.setNextPageId(secondLeaf == null ? 0 : secondLeaf.getPageId());
+        if (secondLeaf != null) {
+            leafPage.setNextPageId(secondLeaf.getPageId());
+        }
         firstLeaf.setSMBit(true);
         firstLeaf.setNextPageId(newPageId);
 
-        //TODO split point
-        int splitPoint = 0;
+        try {
+            firstLeaf.splitPage(splitPoint, leafPage);
+        } finally {
+            leafPage.unlatch(session);
+            firstLeaf.unlatch(session);
+        }
+
+//        向上回溯Split， 重置SM_Bit 为0
+//        向上回溯的时候，parent有可能被改过，但没有并发的SMO操作
+//        如果是root的split，则创建新的Page，然后设置好child，rootPageId，SM_Bit？
+//        接着需要一个old rootPage转换newPageId，new rootPage转换旧的rootPageId的过程，注意同步
+        FSNodePage parentPage = (FSNodePage) fastStore.getPage(firstLeaf.getParentPageId());
+        //TODO SM_BIT?
 
 
-//
-//        if (tryOnly && entryCount > 1) {
-//            int x = find(row, false, true, true);
-//            if (entryCount < 5) {
-//                // required, otherwise the index doesn't work correctly
-//                return entryCount / 2;
-//            }
-//            // split near the insertion point to better fill pages
-//            // split in half would be:
-//            // return entryCount / 2;
-//            int third = entryCount / 3;
-//            return x < third ? third : x >= 2 * third ? 2 * third : x;
-//        }
+
 
 
     }

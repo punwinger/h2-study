@@ -46,11 +46,11 @@ public class FetchCursor implements Cursor {
         this.index = index;
         this.innerCursor = innerCursor;
         this.fastStore = fastStore;
-        this.max = max;
+
+        //min.getKey == Long.MIN_VALUE for easy to find the smallest one >= cmpRecord
         this.min = min;
-
-
-        searchAndFetchLeaf(null, min);
+        //min.getKey == Long.MAX_VALUE
+        this.max = max;
     }
 
 
@@ -101,12 +101,8 @@ public class FetchCursor implements Cursor {
             return false;
         }
 
-        int idx = leaf.binarySearch(compare, true, true);
-        if (idx < 0) {
-            idx = -idx - 1;
-        }
-        candidate = leaf.getRecords(idx);
-        candidate = findNextRecord(candidate, compare);
+        //find the next record >= compare
+        candidate = leaf.findRecord(compare, false);
 
         while (candidate == null) {
             nextLeaf = (FSLeafPage) fastStore.getPage(leaf.getNextPageId());
@@ -132,12 +128,7 @@ public class FetchCursor implements Cursor {
                 return false;
             }
 
-            idx = nextLeaf.binarySearch(compare, true, true);
-            if (idx < 0) {
-                idx = -idx - 1;
-            }
-            candidate = nextLeaf.getRecords(idx);
-            candidate = findNextRecord(candidate, compare);
+            candidate = nextLeaf.findRecord(compare, false);
 
             innerCursor.pushPage(leaf);
             leaf.unlatch(session);
@@ -208,9 +199,9 @@ public class FetchCursor implements Cursor {
         return from;
     }
 
-    private void searchAndFetchLeaf(PageBase from, FSRecord record) {
+    void searchAndFetchLeaf(PageBase from, FSRecord record) {
         while (true) {
-            FSLeafPage firstLeaf = innerCursor.searchLeaf(session, from, record, true, false);
+            FSLeafPage firstLeaf = innerCursor.searchLeaf(session, from, record, false, false);
             if (firstLeaf == null) {
                 from = innerCursor.traverseBack(session);
                 continue;

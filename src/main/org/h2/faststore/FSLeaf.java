@@ -12,6 +12,8 @@
 
 package org.h2.faststore;
 
+import org.h2.faststore.FSDirectoryLeaf.Directory;
+import org.h2.faststore.FSDirectoryLeaf.SpacePos;
 import org.h2.faststore.type.FSRecord;
 import org.h2.message.DbException;
 import org.h2.result.SearchRow;
@@ -22,6 +24,7 @@ import org.h2.value.Value;
 import org.h2.value.ValueInt;
 import org.h2.value.ValueString;
 
+import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Random;
 
@@ -161,74 +164,186 @@ abstract class FSLeaf {
 //    TYPE S
 //    Add:66780 Del:66823 spend:99 find:292 spend:99
 
+    public static <T> T[] createArray(T[] old) {
+        return  (T[]) Array.newInstance(
+                old.getClass().getComponentType(), 1 + COPY_THRESHOLD);
+    }
+
+    public static SpacePos[] createArray2(SpacePos[] old) {
+        return new SpacePos[1 + COPY_THRESHOLD];
+    }
+
+    public static Directory[] createArray2(Directory[] old) {
+        return new Directory[1 + COPY_THRESHOLD];
+    }
+
+    public static TestA[] createArray2(TestA[] old) {
+        return new TestA[1 + COPY_THRESHOLD];
+    }
+
+    public static ArrayObject[] createArray3(ArrayObject[] old, ArrayObject a) {
+        return  a.createArray(1 + COPY_THRESHOLD);
+    }
+
+    interface ArrayObject {
+        ArrayObject[] createArray(int sz);
+    }
+
+
+//    public static <T> T[] insert(T[] old, int oldSize, int pos, T x) {
+//        T[] result;
+//        if (old.length > oldSize) {
+//            result = old;
+//        } else {
+//            // according to a test, this is as fast as "new Row[..]"
+//            result = (T[]) Array.newInstance(
+//                    old.getClass().getComponentType(), oldSize + 1 + COPY_THRESHOLD);
+//            if (pos > 0) {
+//                System.arraycopy(old, 0, result, 0, pos);
+//            }
+//        }
+//        if (oldSize - pos > 0) {
+//            System.arraycopy(old, pos, result, pos + 1, oldSize - pos);
+//        }
+//        result[pos] = x;
+//        return result;
+//    }
+
+    private static class TestA implements ArrayObject {
+        private int a;
+        private int b;
+        private int c;
+        private int d;
+        private String e;
+
+        @Override
+        public ArrayObject[] createArray(int sz) {
+            return new TestA[sz];
+        }
+    }
+
     public static void main(String[] args) {
-        IndexColumn[] idxColumn = new IndexColumn[] {new IndexColumn()};
-        int[] columnIds = new int[] {0};
-        CompareMode mode = CompareMode.getInstance(null, 0, true);
 
-        String type = args[0];
-        FSLeaf leaf = null;
-        if ("S".equals(type)) {
-            leaf = new FSSimpleLeaf(idxColumn, columnIds, mode, 2);
-        } else {
-            leaf = new FSDirectoryLeaf(idxColumn, columnIds, mode, 2);
-        }
+        SpacePos[] empty_array = {};
+        Directory[] empty_array_2 = {};
+        TestA[] empty_array_3 = {};
+        TestA t = new TestA();
 
-        //record len 20~30. max 204~136
-        // add, remove
-        // find
-        int recordMax = 200;
-        FSRecord[] recs = new FSRecord[recordMax];
-        for (int i = 0; i < recordMax; i++) {
-            recs[i] = createRecord();
+        long beg = 0;
 
-            if (i < 100) {
-                leaf.addRow(recs[i]);
+        if (args[0].equals("aa")) {
+            beg = System.nanoTime();
+            for (int i = 0; i < 9999; i++) {
+                SpacePos[] a = createArray(empty_array);
+            }
+        } else if (args[0].equals("ab")) {
+            beg = System.nanoTime();
+            for (int i = 0; i < 9999; i++) {
+                SpacePos[] a = createArray2(empty_array);
+            }
+        } else if (args[0].equals("ba")) {
+            beg = System.nanoTime();
+            for (int i = 0; i < 9999; i++) {
+                Directory[] a = createArray(empty_array_2);
+            }
+        } else if (args[0].equals("bb")) {
+            beg = System.nanoTime();
+            for (int i = 0; i < 9999; i++) {
+                Directory[] a = createArray2(empty_array_2);
+            }
+        } else if (args[0].equals("ca")) {
+            beg = System.nanoTime();
+            for (int i = 0; i < 99999; i++) {
+                TestA[] a = createArray(empty_array_3);
+            }
+        } else if (args[0].equals("cb")) {
+            beg = System.nanoTime();
+            for (int i = 0; i < 99999; i++) {
+                TestA[] a = createArray2(empty_array_3);
+            }
+        } else if (args[0].equals("cc")) {
+            beg = System.nanoTime();
+            for (int i = 0; i < 99999; i++) {
+                //TestA[] a = (TestA[]) createArray3(empty_array_3, t);
+                TestA[] a = (TestA[]) t.createArray(1 + COPY_THRESHOLD);
             }
         }
 
-        long begin = System.currentTimeMillis();
-        int add = 0;
-        int del = 0;
 
-        for (int i = 0; i < 10000; i++) {
-            for (int j = 0; j < 10; j++) {
-                int r = random.nextInt(recordMax);
-                int e = leaf.entryCount;
-                leaf.addRow(recs[r]);
-                if (e < leaf.entryCount) {
-                    add++;
-                }
-            }
+        long dur = System.nanoTime() - beg;
+        System.out.println("spend time:" + dur);
 
-            for (int j = 0; j < 20; j++) {
-                int r = random.nextInt(recordMax);
-                int e = leaf.entryCount;
-                leaf.removeRow(recs[r]);
 
-                if (e > leaf.entryCount) {
-                    del++;
-                }
 
-                recs[r].setOffset(-1);
-                recs[r].setNext(null);
-            }
-        }
 
-        long end1 = System.currentTimeMillis();
-
-        int find = 0;
-        for (int i = 0; i < 1000; i++) {
-            int r = random.nextInt(recordMax);
-            if (leaf.findRecord(recs[r], true) != null) {
-                find++;
-            }
-        }
-
-        long end2 = System.currentTimeMillis();
-        System.out.println("TYPE " + type);
-        System.out.println("Add:" + add + " Del:" + del
-                + " spend:" + (end1 - begin) + " find:" + find + " spend:" + (end2 - begin));
+//        //performance test.
+//        IndexColumn[] idxColumn = new IndexColumn[] {new IndexColumn()};
+//        int[] columnIds = new int[] {0};
+//        CompareMode mode = CompareMode.getInstance(null, 0, true);
+//
+//        String type = args[0];
+//        FSLeaf leaf = null;
+//        if ("S".equals(type)) {
+//            leaf = new FSSimpleLeaf(idxColumn, columnIds, mode, 2);
+//        } else {
+//            leaf = new FSDirectoryLeaf(idxColumn, columnIds, mode, 2);
+//        }
+//
+//        //record len 20~30. max 204~136
+//        // add, remove
+//        // find
+//        int recordMax = 200;
+//        FSRecord[] recs = new FSRecord[recordMax];
+//        for (int i = 0; i < recordMax; i++) {
+//            recs[i] = createRecord();
+//
+//            if (i < 100) {
+//                leaf.addRow(recs[i]);
+//            }
+//        }
+//
+//        long begin = System.currentTimeMillis();
+//        int add = 0;
+//        int del = 0;
+//
+//        for (int i = 0; i < 10000; i++) {
+//            for (int j = 0; j < 10; j++) {
+//                int r = random.nextInt(recordMax);
+//                int e = leaf.entryCount;
+//                leaf.addRow(recs[r]);
+//                if (e < leaf.entryCount) {
+//                    add++;
+//                }
+//            }
+//
+//            for (int j = 0; j < 20; j++) {
+//                int r = random.nextInt(recordMax);
+//                int e = leaf.entryCount;
+//                leaf.removeRow(recs[r]);
+//
+//                if (e > leaf.entryCount) {
+//                    del++;
+//                }
+//
+//                recs[r].setOffset(-1);
+//                recs[r].setNext(null);
+//            }
+//        }
+//
+//        long end1 = System.currentTimeMillis();
+//
+//        int find = 0;
+//        for (int i = 0; i < 1000; i++) {
+//            int r = random.nextInt(recordMax);
+//            if (leaf.findRecord(recs[r], true) != null) {
+//                find++;
+//            }
+//        }
+//
+//        long end2 = System.currentTimeMillis();
+//        System.out.println("TYPE " + type);
+//        System.out.println("Add:" + add + " Del:" + del
+//                + " spend:" + (end1 - begin) + " find:" + find + " spend:" + (end2 - begin));
 
     }
 
