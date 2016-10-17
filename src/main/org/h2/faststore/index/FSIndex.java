@@ -43,7 +43,7 @@ abstract public class FSIndex extends BaseIndex implements LockBase {
     protected SXLatch latch;
 
     //long for support large file
-    private long rootPageId;
+    protected long rootPageId;
 
     private Column[] storeColumns;
 
@@ -74,6 +74,20 @@ abstract public class FSIndex extends BaseIndex implements LockBase {
         return aKey == bKey ? 0 : (aKey > bKey ? 1 : -1);
     }
 
+    public int compareAllKeys(FSRecord a, FSRecord b, boolean checkDuplicate) {
+        int c = compareKeys(a, b);
+        if (c == 0) {
+            if (checkDuplicate && getIndexType().isUnique()) {
+                if (!containsNullAndAllowMultipleNull(b)) {
+                    throw getDuplicateKeyException(b.toString());
+                }
+            }
+            c = compareInnerKey(a, b);
+        }
+
+        return c;
+    }
+
     public void latchForInstant(Session session, boolean exclusive) {
         latch.latch(session, exclusive);
         latch.unlatch(session);
@@ -91,7 +105,7 @@ abstract public class FSIndex extends BaseIndex implements LockBase {
         FSRecord max = createFSRecord(last, Long.MAX_VALUE);
 
         FetchCursor cursor = new FetchCursor(session, this, innerSearchCursor, fastStore, min, max);
-        cursor.searchAndFetchLeaf(fastStore.getPage(rootPageId), min);
+        cursor.searchAndFetchLeaf(null, min);
         return cursor;
     }
 
@@ -156,4 +170,10 @@ abstract public class FSIndex extends BaseIndex implements LockBase {
     public void setRootPageId(long rootPageId) {
         this.rootPageId = rootPageId;
     }
+
+    public FastStore getStore() {
+        return fastStore;
+    }
+
+    abstract public int getMaxRecordSize();
 }

@@ -13,6 +13,7 @@
 package org.h2.faststore.type;
 
 import org.h2.api.ErrorCode;
+import org.h2.engine.SysProperties;
 import org.h2.message.DbException;
 import org.h2.result.SearchRow;
 import org.h2.result.SortOrder;
@@ -36,10 +37,20 @@ public class FSRecord implements SearchRow {
 
     private int offset = -1;
 
+    //TODO cannot be var length. must be fix length!! Because page split will change childPageID.
     private long childPageId;
 
     public FSRecord(int length) {
         data = new Value[length];
+    }
+
+    public FSRecord copy() {
+        FSRecord cp = new FSRecord(data.length);
+        System.arraycopy(data, 0, cp.data, 0, data.length);
+        cp.innerKey = innerKey;
+        cp.offset = offset;
+        cp.childPageId = childPageId;
+        return cp;
     }
 
     public int compare(FSRecord other, int[] columnId,

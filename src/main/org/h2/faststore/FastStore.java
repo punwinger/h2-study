@@ -28,6 +28,7 @@ public class FastStore {
 
 
     public PageBase getPage(long pageId) {
+        //TODO 保证pageID全局只对应一个对象
         return null;
     }
 
@@ -41,5 +42,12 @@ public class FastStore {
 
     public long allocatePage() {
         return 0;
+    }
+
+    public void updatePage(PageBase page) {
+//        cache.update(page, page.getPageId());
+    }
+
+    public void freePage(PageBase page) {
     }
 }

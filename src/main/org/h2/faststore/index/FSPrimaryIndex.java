@@ -71,68 +71,36 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
         indexLock.unlock(s);
     }
 
-    // add & split
-    // rowList??  -> add(Session session, RowList list)
-    // add(no split):
-    // 1.index share lock
-    // 2.binary search to find the leaf page
-    // 3. enough empty space ? if true exclusive lock the leaf page else add(split)
-    // 4. enough empty space ? if true add record to the empty space, point to next record(MVCC info)
-    //      else release lock add(split)
-    // 5. fix the pointer of prev record
-    // 6. m_own > 8 -> fix pointer in directory(thread-safe? copy to local?)
-
-    // add(split):
-    // 1.index exclusive lock
-    // 2.binary search find the leaf page
-    // 3.enough space? if true exclusive lock leaf page add(no split) return;
-    // 4.split leaf page (split point @ 1/3, 2/3)
-    // take care of row lock
-    // 5. to be continued...
-
-
-    // root split
-    // keep old root id unchanged and update two new node
     @Override
     public void add(Session session, Row row) {
-        //no spilt add
-        //indexLock.lock(session, false);
-
-        //check whether need to split
         FSRecord rec = createFSRecord(row);
-        FSLeafPage firstLeaf = searchFirstLeaf(session, rec, true);
-
-        int splitPoint = firstLeaf.checkNeedSplitIfAdd(rec);
-        if (splitPoint >= 0) {
-            //page split
-
-
-
-
-        } else {
-
-
-
-
-        }
-
-
-
-
-    }
-
-    private FSLeafPage searchFirstLeaf(Session session, FSRecord rec, boolean checkDuplicate) {
         InnerSearchCursor innerCursor = new InnerSearchCursor(this, fastStore);
-        PageBase from = null;
+        FSLeafPage leafPage = searchFirstLeaf(session, innerCursor, null, rec, true);
         while (true) {
-            FSLeafPage firstLeaf =  innerCursor.searchLeaf(session, from, rec, checkDuplicate, true);
-            if (firstLeaf != null) {
-                return firstLeaf;
-            } else {
-                from = innerCursor.traverseBack(session);
+            leafPage = findValidLeaf(session, leafPage, rec);
+            if (leafPage == null) {
+                PageBase from = innerCursor.traverseBack(session);
+                leafPage = searchFirstLeaf(session, innerCursor, from, rec, true);
+                continue;
             }
+
+            int splitPoint = leafPage.checkNeedSplitIfAdd(rec);
+            if (splitPoint > 0) {
+                //page split will unlatch leafPage
+                //maybe latch leafPage again and test if it's valid or not?
+                pageSplit(session, leafPage, splitPoint);
+                innerCursor.clear();
+                leafPage = searchFirstLeaf(session, innerCursor, null, rec, true);
+                continue;
+            }
+
+            leafPage.addRow(rec, -splitPoint);
+            leafPage.unlatch(session);
+            break;
         }
     }
+
+
 
     private void pageSplit(Session session, FSLeafPage firstLeaf, int splitPoint) {
         FSLeafPage secondLeaf = (FSLeafPage) fastStore.getPage(firstLeaf.getNextPageId());
@@ -140,6 +108,7 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
             fastStore.fixPage(secondLeaf.getPageId());
         }
 
+        //TODO fix all affected pages in buffer pool before latch
         latch.latch(session, true);
 
         long newPageId = fastStore.allocatePage();
@@ -150,37 +119,170 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
             leafPage.setNextPageId(secondLeaf.getPageId());
         }
         firstLeaf.setSMBit(true);
+        firstLeaf.setPageLSN(firstLeaf.getPageLSN() + 1);
         firstLeaf.setNextPageId(newPageId);
+        FSRecord pivot = null;
 
-        try {
-            firstLeaf.splitPage(splitPoint, leafPage);
-        } finally {
+        pivot = firstLeaf.splitPage(splitPoint, leafPage);
+        //leafPage split is shared, so copy it
+        pivot = pivot.copy();
+
+        if (firstLeaf.getPageId() == rootPageId) {
+            //root page split
+            updateRootPage(session, firstLeaf, pivot, leafPage);
+            firstLeaf.setSMBit(false);
+            leafPage.setSMBit(false);
             leafPage.unlatch(session);
             firstLeaf.unlatch(session);
+
+        } else {
+            FSNodePage parentPage = (FSNodePage) fastStore.getPage(firstLeaf.getParentPageId());
+            leafPage.unlatch(session);
+            firstLeaf.unlatch(session);
+            nodePageSplit(session, parentPage, firstLeaf, pivot, leafPage, leafPage.getMinMaxKey(false));
         }
 
-//        向上回溯Split， 重置SM_Bit 为0
-//        向上回溯的时候，parent有可能被改过，但没有并发的SMO操作
-//        如果是root的split，则创建新的Page，然后设置好child，rootPageId，SM_Bit？
-//        接着需要一个old rootPage转换newPageId，new rootPage转换旧的rootPageId的过程，注意同步
-        FSNodePage parentPage = (FSNodePage) fastStore.getPage(firstLeaf.getParentPageId());
-        //TODO SM_BIT?
+        latch.unlatch(session);
+    }
 
+    //TODO pivot must not be shared...FSNodePage cannot share pivot.
+    private void nodePageSplit(Session session, FSNodePage page, PageBase oldChildPage,
+                                FSRecord pivot, PageBase newChildPage, FSRecord oldKey) {
+        page.latch(session, true);
+        page.setPageLSN(page.getPageLSN() + 1);
+        int pos = page.checkNeedSplitIfAdd(pivot);
+        if (pos > 0) {
+            //split page
+            long newPageId = fastStore.allocatePage();
+            FSNodePage rightPage = FSNodePage.create(newPageId, this);
+            //only after parentPage add rightPage then it can be visit so not latch for rightPage needed
+//            rightPage.latch(session, true);
+            rightPage.setSMBit(true);
+            page.setSMBit(true);
+            page.setPageLSN(page.getPageLSN() + 1);
+            FSRecord newPivot = page.splitPage(pos, rightPage);
+            FSNodePage parentPage = null;
+            if (page.getPageId() == rootPageId) {
+                //root split
+                parentPage = updateRootPage(session, page, pivot, rightPage);
+            } else {
+                newPivot.setChildPageId(newPageId);
+                parentPage = (FSNodePage) fastStore.getPage(page.getParentPageId());
+            }
 
+            //unlatch before traverse back
+            page.unlatch(session);
+//            rightPage.unlatch(session);
+            nodePageSplit(session, parentPage, page, newPivot,
+                    rightPage, rightPage.getMinMaxKey(false));
 
+            //split will change oldPage's parentPageId
+            if (oldChildPage.getPageId() == rightPage.getPageId()) {
+                page.unlatch(session);
+                page = rightPage;
+                page.latch(session, true);
+            } else if (oldChildPage.getPageId() != page.getPageId()) {
+                DbException.throwInternalError();
+            }
+        }
 
-
+        page.addChild(oldChildPage.getPageId(), pivot, newChildPage.getPageId(), oldKey);
+        //    oldPage.latch(session, true);
+//            newPage.latch(session, true);
+        long newParentPageId = page.getPageId();
+        newChildPage.setParentPageId(newParentPageId);
+        oldChildPage.setSMBit(false);
+        newChildPage.setSMBit(false);
+        page.unlatch(session);
     }
 
 
+    private FSNodePage updateRootPage(Session session, PageBase oldRootPage,
+                                   FSRecord pivot, PageBase rightPage) {
+        //root page id remains the same
+        long pageId = fastStore.allocatePage();
+        //must update cache.
+        oldRootPage.setPageId(pageId);
+        fastStore.updatePage(oldRootPage);
+        FSNodePage newRoot = FSNodePage.create(rootPageId, this);
+        newRoot.latch(session, true);
+        newRoot.initPage(oldRootPage.getPageId(), pivot, rightPage.getPageId());
+        //must updatePage before unlatch see InnerSearchCursor.searchLeaf
+        fastStore.updatePage(newRoot);
+        newRoot.unlatch(session);
+
+        return newRoot;
+    }
 
     @Override
     public void remove(Session session, Row row) {
         //in-place update ?
+
+        //change last record of the parentNode
+        //problem: may need split!  limit the insert row size + compact & insert
+
+        //page delete
+        FSRecord rec = createFSRecord(row);
+        InnerSearchCursor innerCursor = new InnerSearchCursor(this, fastStore);
+        FSLeafPage leafPage = searchFirstLeaf(session, innerCursor, null, rec, true);
+
+        while (true) {
+            leafPage = findValidLeaf(session, leafPage, rec);
+            if (leafPage != null) {
+                break;
+            }
+
+            PageBase from = innerCursor.traverseBack(session);
+            leafPage = searchFirstLeaf(session, innerCursor, from, rec, true);
+        }
+
+        FSRecord newLast = leafPage.removeRow(rec);
+        if (newLast == null) {
+            return;
+        }
+
+        if (newLast == rec) {
+            //page delete
+            //todo free page
+            //set child page id
+        } else {
+            //change last
+        }
+
+
     }
 
 
 
+    private FSLeafPage findValidLeaf(Session session, FSLeafPage leafPage, FSRecord rec) {
+        while (leafPage.getNextPageId() != PageBase.INVALID_PAGE_ID
+                && compareAllKeys(leafPage.getMinMaxKey(false), rec, false) < 0) {
+            //firstLeaf is splitting, insert into secondLeaf
+            long nextPageId = leafPage.getNextPageId();
+            FSLeafPage nextLeafPage = (FSLeafPage) fastStore.getPage(nextPageId);
+            nextLeafPage.latch(session, false);
+            leafPage.unlatch(session);
+            if (nextLeafPage.isEmptyPage()) {
+                nextLeafPage.unlatch(session);
+                return null;
+            }
+            leafPage = nextLeafPage;
+        }
+
+        return leafPage;
+    }
+
+    private FSLeafPage searchFirstLeaf(Session session, InnerSearchCursor innerCursor, PageBase from,
+                                       FSRecord rec, boolean checkDuplicate) {
+        while (true) {
+            FSLeafPage firstLeaf =  innerCursor.searchLeaf(session, from, rec, checkDuplicate, true);
+            if (firstLeaf != null) {
+                return firstLeaf;
+            } else {
+                from = innerCursor.traverseBack(session);
+            }
+        }
+    }
 
     @Override
     public double getCost(Session session, int[] masks, TableFilter filter, SortOrder sortOrder) {
@@ -189,8 +291,9 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
 
     @Override
     public void remove(Session session) {
-
+        //??
     }
+
 
     @Override
     public void truncate(Session session) {
@@ -228,4 +331,10 @@ public class FSPrimaryIndex extends FSIndex implements LockBase {
     }
 
 
+    @Override
+    public int getMaxRecordSize() {
+        //TODO get the max record size store in NodePage.  (for SpaceManager allocate)
+
+        return 0;
+    }
 }

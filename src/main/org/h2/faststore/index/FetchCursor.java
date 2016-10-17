@@ -53,7 +53,6 @@ public class FetchCursor implements Cursor {
         this.max = max;
     }
 
-
     @Override
     public Row get() {
         if (currentRow == null && current != null) {
@@ -142,6 +141,7 @@ public class FetchCursor implements Cursor {
         return true;
     }
 
+    //TODO MVCC will not work?
     //1.lsn is invalid  ->  return false
     //2.leaf page is rightmost   -> return true
     //3.current > max   -> return true

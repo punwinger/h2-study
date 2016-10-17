@@ -67,15 +67,28 @@ public class InnerSearchCursor {
     public FSLeafPage searchLeaf(Session session, PageBase from, FSRecord record,
                                  boolean checkDuplicate, boolean latchExclusive) {
         PageBase parent = null;
-        PageBase child = from == null ? fastStore.getPage(index.getRootPageId()) : from;
+        PageBase child = from;
+        boolean childIsRoot = false;
+        if (child == null) {
+            child = fastStore.getPage(index.getRootPageId());
+            childIsRoot = true;
+        }
         FSLeafPage firstLeaf = null;
         while (true) {
             if (!child.isLeaf()) {
                 child.latch(session, false);
 
+                //root split
+                if (childIsRoot && child.getPageId() != index.getRootPageId()) {
+                    child.unlatch(session);
+                    child = fastStore.getPage(index.getRootPageId());
+                    continue;
+                }
+
                 FSRecord maxKey = child.getMinMaxKey(false);
+                //not in delete
                 if (!child.isEmptyPage() &&
-                        (index.compareKeys(record, maxKey) <= 0 ||
+                        (maxKey == null || index.compareKeys(record, maxKey) <= 0 ||
                                 (index.compareKeys(record, maxKey) > 0 && !child.getSMBit()))) {
 
                     if (parent != null) {
@@ -105,8 +118,16 @@ public class InnerSearchCursor {
 //                                        child.getPageLSN() + " != " + info.pageLSN);
 //                    }
                 }
+                childIsRoot = true;
             } else {
                 child.latch(session, latchExclusive);
+                //root split
+                if (childIsRoot && child.getPageId() != index.getRootPageId()) {
+                    child.unlatch(session);
+                    child = fastStore.getPage(index.getRootPageId());
+                    continue;
+                }
+
                 if (parent != null) {
                     pushPage(parent);
                     parent.unlatch(session);
@@ -121,7 +142,7 @@ public class InnerSearchCursor {
     }
 
     public PageBase traverseBack(Session session) {
-        //we are at point of structural consistency (POSC)
+        //make sure at point of structural consistency (POSC)
         index.latchForInstant(session, false);
 
         Info info = null;
