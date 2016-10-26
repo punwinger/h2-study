@@ -33,6 +33,7 @@ import org.h2.value.Value;
 
 import java.util.HashMap;
 import java.util.LinkedList;
+import java.util.concurrent.atomic.AtomicLong;
 
 abstract public class FSIndex extends BaseIndex implements LockBase {
 
@@ -46,6 +47,8 @@ abstract public class FSIndex extends BaseIndex implements LockBase {
     protected long rootPageId;
 
     private Column[] storeColumns;
+
+    protected AtomicLong rowCount = new AtomicLong(0);
 
 
     public FSIndex(FSTable table, FastStore fastStore) {

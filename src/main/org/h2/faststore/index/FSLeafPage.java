@@ -26,6 +26,8 @@ public class FSLeafPage extends PageBase {
 
     private long nextPageId = INVALID_PAGE_ID;
 
+    private long prevPageId = INVALID_PAGE_ID;
+
     public FSLeafPage(long pageId, FSIndex index, int minDirectoryCount,
                       int maxDirectoryCount, int pageSize) {
         super(pageId, index, pageSize, minDirectoryCount, maxDirectoryCount);
@@ -90,6 +92,13 @@ public class FSLeafPage extends PageBase {
         this.nextPageId = nextPageId;
     }
 
+    public long getPrevPageId() {
+        return prevPageId;
+    }
+
+    public void setPrevPageId(long prevPageId) {
+        this.prevPageId = prevPageId;
+    }
 
     @Override
     public String toString() {

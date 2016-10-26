@@ -48,31 +48,21 @@ class SpaceManager {
     private int count;
 
     private int leftSize;
-    private int minLeftSize;
 
-    public SpaceManager(int left, int right, int mlSize) {
+    public SpaceManager(int left, int right) {
         poses = (SpacePos[]) SpacePos.INSTANCE.insertInArray(poses,
                 0, 0, new SpacePos(left, right));
         count = 1;
         leftSize = right - left + 1;
-        minLeftSize = mlSize;
-    }
-
-    public SpaceManager(int size, int minLeftSize) {
-        this(0, size - 1, minLeftSize);
     }
 
     public SpaceManager(int size) {
-        this(0, size - 1, 0);
+        this(0, size - 1);
     }
 
     // O(N)
     //TODO better algorithm in O(logN)?
     public int tryAllocate(int size) {
-        if (minLeftSize > 0 && leftSize - size < minLeftSize) {
-            return -1;
-        }
-
         for (int i = 0; i < count; ++i) {
             int sz = poses[i].getSize();
             if (sz >= size) {
@@ -103,7 +93,7 @@ class SpaceManager {
     }
 
     // O(logN)
-    public void deallocate(int offset, int size) {
+    public int deallocate(int offset, int size) {
         leftSize += size;
 
         int l = 0, r = count - 1;
@@ -131,21 +121,54 @@ class SpaceManager {
         if (l > 0 && poses[l - 1].right + 1 == offset) {
             if (hasMerge) {
                 poses[l - 1].right = poses[l].right;
-                poses = (SpacePos[]) SpacePos.INSTANCE.removeFromArray(poses, count, l);
-                count--;
-                return;
+                poses = (SpacePos[]) SpacePos.INSTANCE.removeFromArray(poses, count--, l);
+            } else {
+                poses[l - 1].right += size;
             }
 
-            poses[l - 1].right += size;
-            hasMerge = true;
+            return l - 1;
         }
 
         if (!hasMerge) {
             poses = (SpacePos[]) SpacePos.INSTANCE.insertInArray(
-                    poses, count, l, new SpacePos(offset, offset + size - 1));
-            count++;
+                    poses, count++, l, new SpacePos(offset, offset + size - 1));
         }
+
+        return l;
     }
+
+    //todo better algorithm
+    //return:
+    // < 0 if can not allocate newSize
+    // > 0 for allocate pos
+    public int allocateNewAndDeallocateOld(int newSize, int oldOffset, int oldSize) {
+        int delPos = deallocate(oldOffset, oldSize);
+        int newPos = tryAllocate(newSize);
+        if (newPos < 0) {
+            //cannot allocate newSize, revert deallocate oldSize
+            SpacePos sp = poses[delPos];
+            if (sp.left != oldOffset) {
+                //oldOffset merge into left space
+                int spRight = sp.right;
+                sp.right = oldOffset - 1;
+
+                if (spRight > oldOffset + oldSize + 1) {
+                    //right space merge into left space
+                    poses = (SpacePos[]) SpacePos.INSTANCE.insertInArray(
+                            poses, count++, delPos + 1, new SpacePos(oldOffset + oldSize, spRight));
+                }
+            } else if (sp.getSize() > oldSize) {
+                //oldOffset merge into right space
+                sp.left = oldOffset + oldSize;
+            } else {
+                //only oldOffset
+                poses = (SpacePos[]) SpacePos.INSTANCE.removeFromArray(poses, count--, delPos);
+            }
+        }
+
+        return newPos;
+    }
+
 
     @Override
     public String toString() {

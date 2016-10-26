@@ -49,5 +49,10 @@ public class FastStore {
     }
 
     public void freePage(PageBase page) {
+        if (page != null) {
+            page.free();
+        }
+
+        //cache.free()
     }
 }

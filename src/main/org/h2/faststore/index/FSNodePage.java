@@ -149,6 +149,12 @@ public class FSNodePage extends PageBase {
     }
 
     @Override
+    public void free() {
+        super.free();
+        maxRecord = null;
+    }
+
+    @Override
     public FSRecord getMinMaxKey(boolean min) {
         if (!isEmptyPage() && entryCount == 0) {
             return null;
@@ -191,15 +197,90 @@ public class FSNodePage extends PageBase {
         return null;
     }
 
+
+    public long getMaxRecordChildPageId() {
+        return maxRecord.getChildPageId();
+    }
+
     //return:
-    // 1.null if maxRecord not change
-    // 2.new max if maxRecord change
-    public FSRecord replaceMaxRecordInChild(FSRecord oldMax, FSRecord newMax) {
-        //if all record change to max size... it is over size!!!
+    // < 0 if can not allocate newSize
+    // > 0 for allocate pos
+    public int allocateNewAndDeallocateOld(FSRecord oldRecord, FSRecord newRecord) {
+        int oldRecordSize = index.getRecordIndexSize(data, oldRecord);
+        int newRecordSize = index.getRecordIndexSize(data, newRecord);
 
-        // page split & try replace recurse
+        int pos = spaceManager.allocateNewAndDeallocateOld(newRecordSize,
+                oldRecord.getOffset(), oldRecordSize);
 
+        if (pos > 0) {
+            int offset = spaceManager.allocate(pos, newRecordSize);
+            newRecord.setOffset(offset);
+        }
 
+        return pos;
+    }
+
+    public void fixEntryInChild(FSRecord oldMax, FSRecord newMax) {
+        //find the record == oldMax in directory or not found (it's in maxRecord)
+        int idx = find(oldMax, false);
+        FSRecord prevRecord = null, myOldMax = null;
+
+        if (idx >= 0) {
+            Directory dir = directories[idx];
+            myOldMax = dir.end;
+            if (dir.count == 1) {
+                dir.start = dir.end = newMax;
+
+                if (idx > 0) {
+                    prevRecord = directories[idx - 1].end;
+                }
+            } else {
+                prevRecord = dir.start;
+                for (int i = 1; i < dir.count - 1; i++) {
+                    prevRecord = prevRecord.getNext();
+                }
+
+                dir.end = newMax;
+            }
+
+            if (prevRecord != null) {
+                prevRecord.setNext(newMax);
+            }
+
+            newMax.setNext(myOldMax.getNext());
+        } else {
+            idx = -idx - 1;
+            if (idx >= directoryCount) {
+                //not in childPage of maxRecord
+                DbException.throwInternalError();
+            }
+
+            //dir.count > 1
+            Directory dir = directories[idx];
+            prevRecord = idx > 0 ? directories[idx - 1].end : null;
+            myOldMax = dir.start;
+            for (int i = 0; i < dir.count - 1; i++) {
+                int cmp = index.compareAllKeys(myOldMax, oldMax, false);
+                if (cmp == 0) {
+                    if (prevRecord != null) {
+                        prevRecord.setNext(newMax);
+                    }
+                    if (dir.start == myOldMax) {
+                        dir.start = newMax;
+                    }
+                    newMax.setNext(myOldMax.getNext());
+                    break;
+                }
+
+                if (cmp > 0) {
+                    //not found myOldMax == oldMax? it's impossible
+                    DbException.throwInternalError();
+                }
+
+                prevRecord = myOldMax;
+                myOldMax = myOldMax.getNext();
+            }
+        }
     }
 
     private void checkIsMaxRecordChildPageId(long childPageId) {
@@ -212,12 +293,8 @@ public class FSNodePage extends PageBase {
 
     @Override
     public boolean isEmptyPage() {
-        return super.isEmptyPage() && maxRecord.getChildPageId() != INVALID_PAGE_ID;
-    }
-
-    @Override
-    public SpaceManager createSpaceManager() {
-        return new SpaceManager(pageSize, index.getMaxRecordSize());
+        return super.isEmptyPage() && maxRecord != null
+                && maxRecord.getChildPageId() != INVALID_PAGE_ID;
     }
 
     @Override

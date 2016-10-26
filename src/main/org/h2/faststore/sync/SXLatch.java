@@ -45,7 +45,6 @@ public class SXLatch {
     }
 
     public void latch(Session session, boolean exclusive) {
-        boolean needRelease = false;
         synchronized (this) {
             if (lockExclusive == session) {
                 return;
@@ -57,15 +56,14 @@ public class SXLatch {
                     //must release readLock before acquire write lock
                     //needRelease = true;
                     //lockShared.remove(session);
+
+                    DbException.throwInternalError("not implement latch upgrade");
                 } else {
                     return;
                 }
             }
         }
 
-//        if (needRelease) {
-//            readLock.unlock();
-//        }
 
         doLatch(exclusive, session);
 

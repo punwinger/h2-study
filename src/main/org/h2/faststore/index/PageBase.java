@@ -116,7 +116,7 @@ public abstract class PageBase {
         this.pageSize = pageSize;
         this.minDirectoryCount = minDirectoryCount;
         this.maxDirectoryCount = maxDirectoryCount;
-        spaceManager = createSpaceManager();
+        spaceManager = new SpaceManager(pageSize);
     }
 
 //    protected void checkDuplicate(FSRecord cmpRecord, boolean add) {
@@ -126,11 +126,6 @@ public abstract class PageBase {
 //            }
 //        }
 //    }
-
-    public SpaceManager createSpaceManager() {
-        return new SpaceManager(pageSize);
-    }
-
 
     public FSRecord getMinMaxKey(boolean min) {
         if (isEmptyPage()) {
@@ -226,7 +221,7 @@ public abstract class PageBase {
         int allocatePos = spaceManager.tryAllocate(recordSize);
         if (allocatePos < 0) {
             if (entryCount <= 1) {
-                //shouldn't be here because I limit the size of primary key.
+                //shouldn't be here because the size of primary key is limit.
                 DbException.throwInternalError(
                         "entryCount = " + entryCount + " while check need split");
             }
@@ -258,7 +253,7 @@ public abstract class PageBase {
     }
 
     protected void reset() {
-        spaceManager = createSpaceManager();
+        spaceManager = new SpaceManager(pageSize);
         //read all record
         directories = null;
         directoryCount = 0;
@@ -503,7 +498,7 @@ public abstract class PageBase {
         return newLast;
     }
 
-    private void deallocateRecord(FSRecord del) {
+    protected void deallocateRecord(FSRecord del) {
         if (del != null) {
             //TODO handle over flow
             spaceManager.deallocate(del.getOffset(), index.getRecordSize(data, del));
@@ -580,6 +575,14 @@ public abstract class PageBase {
     abstract public void remapChildren();
 
     abstract public FSRecord splitPage(int splitPoint, PageBase newPage);
+
+    public void free() {
+        directories = null;
+        directoryCount = 0;
+        spaceManager = null;
+        sm_bit = false;
+        entryCount = 0;
+    }
 
     public long getPageId() {
         return pageId;

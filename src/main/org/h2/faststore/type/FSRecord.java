@@ -111,7 +111,6 @@ public class FSRecord implements SearchRow {
 //        return comp;
 //    }
 
-
     @Override
     public int getColumnCount() {
         return 0;
